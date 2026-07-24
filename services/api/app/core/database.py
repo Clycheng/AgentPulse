@@ -636,6 +636,14 @@ def init_postgres(conn: Database) -> None:
     ensure_column(conn, "tasks", "expected_output", "TEXT NOT NULL DEFAULT ''")
     ensure_column(conn, "tasks", "output_type", "TEXT NOT NULL DEFAULT 'markdown'")
     ensure_column(conn, "consensus_briefs", "work_items_json", "TEXT NOT NULL DEFAULT '[]'")
+    ensure_column(conn, "knowledge_sources", "origin", "TEXT NOT NULL DEFAULT 'manual'")
+    ensure_column(conn, "knowledge_sources", "source_ref", "TEXT NOT NULL DEFAULT ''")
+    ensure_column(conn, "knowledge_sources", "source_hash", "TEXT NOT NULL DEFAULT ''")
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS ux_knowledge_sources_origin_ref "
+        "ON knowledge_sources(workspace_id, origin, source_ref) "
+        "WHERE source_ref <> ''"
+    )
     ensure_column(conn, "conversations", "discussion_status", "TEXT NOT NULL DEFAULT 'discussing' CHECK(discussion_status IN ('discussing', 'aligned'))")
     # TD-03-T1: Run/RunStep data model. New columns are nullable here; RunService
     # (TD-03-T3) enforces "every Run belongs to a Task" + absolute workdir at the
@@ -648,6 +656,7 @@ def init_postgres(conn: Database) -> None:
     ensure_column(conn, "runs", "lease_owner", "TEXT")
     ensure_column(conn, "runs", "lease_expires_at", "TEXT")
     ensure_column(conn, "runs", "started_at", "TEXT")
+    ensure_column(conn, "runs", "context_manifest_id", "TEXT REFERENCES context_manifests(id) ON DELETE SET NULL")
     ensure_column(conn, "approvals", "run_id", "TEXT REFERENCES runs(id) ON DELETE SET NULL")
     ensure_column(
         conn,
@@ -708,6 +717,7 @@ def init_postgres(conn: Database) -> None:
         "ON business_actions(dedupe_key) WHERE status IN "
         "('pending_approval','approved','executing','succeeded')"
     )
+    _init_td13_tables(conn)
 
 
 def init_sqlite(conn: Database) -> None:
@@ -1140,6 +1150,14 @@ def init_sqlite(conn: Database) -> None:
     ensure_column(conn, "tasks", "expected_output", "TEXT NOT NULL DEFAULT ''")
     ensure_column(conn, "tasks", "output_type", "TEXT NOT NULL DEFAULT 'markdown'")
     ensure_column(conn, "consensus_briefs", "work_items_json", "TEXT NOT NULL DEFAULT '[]'")
+    ensure_column(conn, "knowledge_sources", "origin", "TEXT NOT NULL DEFAULT 'manual'")
+    ensure_column(conn, "knowledge_sources", "source_ref", "TEXT NOT NULL DEFAULT ''")
+    ensure_column(conn, "knowledge_sources", "source_hash", "TEXT NOT NULL DEFAULT ''")
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS ux_knowledge_sources_origin_ref "
+        "ON knowledge_sources(workspace_id, origin, source_ref) "
+        "WHERE source_ref <> ''"
+    )
     ensure_column(conn, "conversations", "discussion_status", "TEXT NOT NULL DEFAULT 'discussing' CHECK(discussion_status IN ('discussing', 'aligned'))")
     # TD-03-T1: Run/RunStep data model. New columns are nullable here; RunService
     # (TD-03-T3) enforces "every Run belongs to a Task" + absolute workdir at the
@@ -1152,6 +1170,7 @@ def init_sqlite(conn: Database) -> None:
     ensure_column(conn, "runs", "lease_owner", "TEXT")
     ensure_column(conn, "runs", "lease_expires_at", "TEXT")
     ensure_column(conn, "runs", "started_at", "TEXT")
+    ensure_column(conn, "runs", "context_manifest_id", "TEXT REFERENCES context_manifests(id) ON DELETE SET NULL")
     ensure_column(conn, "approvals", "run_id", "TEXT REFERENCES runs(id) ON DELETE SET NULL")
     ensure_column(
         conn,
@@ -1209,6 +1228,111 @@ def init_sqlite(conn: Database) -> None:
         "CREATE UNIQUE INDEX IF NOT EXISTS ux_business_actions_active_dedupe "
         "ON business_actions(dedupe_key) WHERE status IN "
         "('pending_approval','approved','executing','succeeded')"
+    )
+    _init_td13_tables(conn)
+
+
+def _init_td13_tables(conn: Database) -> None:
+    """Create the durable company world model used by TD-13.
+
+    The schema deliberately uses portable TEXT/INTEGER/REAL primitives so the
+    same startup migration works for SQLite development and PostgreSQL.
+    """
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS company_events (
+          id TEXT PRIMARY KEY,
+          workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+          event_type TEXT NOT NULL,
+          source_id TEXT NOT NULL,
+          conversation_id TEXT REFERENCES conversations(id) ON DELETE SET NULL,
+          task_id TEXT REFERENCES tasks(id) ON DELETE SET NULL,
+          actor_agent_id TEXT REFERENCES agents(id) ON DELETE SET NULL,
+          actor_user_id TEXT REFERENCES users(id) ON DELETE SET NULL,
+          title TEXT NOT NULL DEFAULT '',
+          content TEXT NOT NULL DEFAULT '',
+          occurred_at TEXT NOT NULL,
+          importance REAL NOT NULL DEFAULT 1.0,
+          confidence REAL NOT NULL DEFAULT 1.0,
+          metadata_json TEXT NOT NULL DEFAULT '{}',
+          created_at TEXT NOT NULL,
+          UNIQUE(workspace_id, event_type, source_id)
+        );
+
+        CREATE TABLE IF NOT EXISTS agent_memories (
+          id TEXT PRIMARY KEY,
+          workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+          agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+          memory_type TEXT NOT NULL CHECK(memory_type IN (
+            'observation','episode','reflection','relationship','lesson'
+          )),
+          title TEXT NOT NULL DEFAULT '',
+          content TEXT NOT NULL,
+          importance REAL NOT NULL DEFAULT 1.0,
+          confidence REAL NOT NULL DEFAULT 1.0,
+          is_private INTEGER NOT NULL DEFAULT 1,
+          promoted INTEGER NOT NULL DEFAULT 0,
+          access_count INTEGER NOT NULL DEFAULT 0,
+          last_accessed_at TEXT,
+          expires_at TEXT,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS memory_links (
+          id TEXT PRIMARY KEY,
+          workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+          memory_id TEXT NOT NULL REFERENCES agent_memories(id) ON DELETE CASCADE,
+          event_id TEXT NOT NULL REFERENCES company_events(id) ON DELETE CASCADE,
+          relation TEXT NOT NULL DEFAULT 'evidence',
+          created_at TEXT NOT NULL,
+          UNIQUE(memory_id, event_id, relation)
+        );
+
+        CREATE TABLE IF NOT EXISTS agent_relationships (
+          id TEXT PRIMARY KEY,
+          workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+          agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+          colleague_agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+          summary TEXT NOT NULL DEFAULT '',
+          trust_score REAL NOT NULL DEFAULT 0.5,
+          interaction_count INTEGER NOT NULL DEFAULT 0,
+          evidence_event_ids_json TEXT NOT NULL DEFAULT '[]',
+          last_interacted_at TEXT,
+          updated_at TEXT NOT NULL,
+          UNIQUE(workspace_id, agent_id, colleague_agent_id),
+          CHECK(agent_id <> colleague_agent_id)
+        );
+
+        CREATE TABLE IF NOT EXISTS context_manifests (
+          id TEXT PRIMARY KEY,
+          workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+          run_id TEXT REFERENCES runs(id) ON DELETE SET NULL,
+          conversation_id TEXT REFERENCES conversations(id) ON DELETE SET NULL,
+          task_id TEXT REFERENCES tasks(id) ON DELETE SET NULL,
+          agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+          query TEXT NOT NULL DEFAULT '',
+          focus_json TEXT NOT NULL DEFAULT '[]',
+          selected_event_ids_json TEXT NOT NULL DEFAULT '[]',
+          selected_memory_ids_json TEXT NOT NULL DEFAULT '[]',
+          prompt_hash TEXT NOT NULL DEFAULT '',
+          token_budget INTEGER NOT NULL DEFAULT 12000,
+          created_at TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_company_events_workspace_time
+          ON company_events(workspace_id, occurred_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_company_events_source
+          ON company_events(workspace_id, event_type, source_id);
+        CREATE INDEX IF NOT EXISTS idx_agent_memories_owner_time
+          ON agent_memories(workspace_id, agent_id, updated_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_agent_memories_promoted
+          ON agent_memories(workspace_id, promoted, updated_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_memory_links_memory
+          ON memory_links(workspace_id, memory_id);
+        CREATE INDEX IF NOT EXISTS idx_context_manifests_run
+          ON context_manifests(workspace_id, run_id, created_at DESC);
+        """
     )
 
 
@@ -1308,6 +1432,11 @@ def reset_database_for_tests() -> None:
                 """
                 DROP TABLE IF EXISTS business_actions CASCADE;
                 DROP TABLE IF EXISTS business_tool_policies CASCADE;
+                DROP TABLE IF EXISTS context_manifests CASCADE;
+                DROP TABLE IF EXISTS memory_links CASCADE;
+                DROP TABLE IF EXISTS agent_relationships CASCADE;
+                DROP TABLE IF EXISTS agent_memories CASCADE;
+                DROP TABLE IF EXISTS company_events CASCADE;
                 DROP TABLE IF EXISTS workspace_model_credentials CASCADE;
                 DROP TABLE IF EXISTS agent_credentials CASCADE;
                 DROP TABLE IF EXISTS task_dependencies CASCADE;
@@ -1336,6 +1465,11 @@ def reset_database_for_tests() -> None:
                 """
                 DROP TABLE IF EXISTS business_actions;
                 DROP TABLE IF EXISTS business_tool_policies;
+                DROP TABLE IF EXISTS context_manifests;
+                DROP TABLE IF EXISTS memory_links;
+                DROP TABLE IF EXISTS agent_relationships;
+                DROP TABLE IF EXISTS agent_memories;
+                DROP TABLE IF EXISTS company_events;
                 DROP TABLE IF EXISTS workspace_model_credentials;
                 DROP TABLE IF EXISTS agent_credentials;
                 DROP TABLE IF EXISTS task_dependencies;

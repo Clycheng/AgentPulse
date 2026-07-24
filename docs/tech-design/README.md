@@ -31,6 +31,7 @@
 | V | [HERMES-VERIFICATION-PLAYBOOK](HERMES-VERIFICATION-PLAYBOOK.md) | **验证剧本**：一次实测清掉全部〔待核〕(V1–V7)并回填各文档。建议最先执行——之后 C/D 的 T6 类任务零猜测 | **是** | 小 |
 | E | [TD-11](TD-11-autonomous-content-execution.md) | 自媒体 AI 公司自动执行闭环：完整分工 brief → 一次确认 → 持久依赖调度 → 内容包 | **是** | 大 |
 | F | [TD-12](TD-12-cloud-deployment-and-desktop-distribution.md) | 官网下载 → 桌面注册/BYOK → 云端 API/Hermes 的部署分发闭环 | **是** | 大 |
+| G | [TD-13](TD-13-company-world-model.md) | 公司事件账本 → 记忆检索 → 独立同事协作 → 反思 | **是** | 大 |
 
 ## Worker AI 执行协议（领任务前必读）
 

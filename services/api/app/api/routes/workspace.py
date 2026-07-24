@@ -37,6 +37,7 @@ from app.schemas.workspace import (
     CreateGroupRequest,
     CreateKnowledgeSourceRequest,
     CreateTaskRequest,
+    ObsidianSyncRequest,
     RecruitAgentRequest,
     ResolveApprovalRequest,
     SendMessageRequest,
@@ -72,6 +73,7 @@ from app.services.workspace import (
     serialize_knowledge_source,
     serialize_message,
     serialize_task,
+    sync_obsidian_documents,
     update_task,
 )
 from app.services.credentials import delete_credential, put_credential
@@ -87,6 +89,14 @@ from app.orchestration.discussion import (
 logger = get_logger(__name__)
 
 router = APIRouter(tags=["workspace"])
+
+
+def _build_context_manifest(*args, **kwargs):
+    # Import lazily: company_memory uses workspace primitives and must not
+    # participate in the module import cycle at application startup.
+    from app.services.company_memory import build_context_manifest
+
+    return build_context_manifest(*args, **kwargs)
 
 
 @router.get("/me/bootstrap", response_model=BootstrapResponse)
@@ -331,22 +341,28 @@ async def reflect_agent(
     current_user: Row = Depends(get_current_user),
     conn: Database = Depends(get_db),
 ):
-    """TD-06-T1: manually trigger one skill-reflection pass (debug/demo)."""
+    """Trigger the employee's skill and evidence-backed memory reflection."""
     _verify_agent_in_workspace(conn, current_user, agent_id)
+    from app.services.company_memory import reflect_agent_memories
+
+    workspace = get_workspace_for_user(conn, current_user["id"])
+    memory_reflection = reflect_agent_memories(
+        conn, workspace_id=workspace["id"], agent_id=agent_id
+    )
     spec = conn.execute(
         "SELECT status, hermes_profile FROM agent_specs WHERE agent_id = ?",
         (agent_id,),
     ).fetchone()
-    if spec is None or spec["status"] != "ready" or not spec["hermes_profile"]:
-        raise HTTPException(status_code=400, detail="该员工尚无可运行的 Hermes profile")
-    names = await run_reflection(
-        conn,
-        agent_id=agent_id,
-        backend=HermesBackend(hermes_bin=settings.hermes_bin),
-        provisioner=build_provisioner_from_settings(),
-        hermes_work_root=settings.hermes_work_root,
-    )
-    return {"skills_learned": names}
+    names = []
+    if spec is not None and spec["status"] == "ready" and spec["hermes_profile"]:
+        names = await run_reflection(
+            conn,
+            agent_id=agent_id,
+            backend=HermesBackend(hermes_bin=settings.hermes_bin),
+            provisioner=build_provisioner_from_settings(),
+            hermes_work_root=settings.hermes_work_root,
+        )
+    return {"skills_learned": names, "memory_reflection": memory_reflection}
 
 
 @router.post("/agents/{agent_id}/credentials", response_model=AgentSpecOut)
@@ -542,6 +558,27 @@ def create_workspace_knowledge_source(
         created_by=current_user["id"],
     )
     return serialize_knowledge_source(source)
+
+
+@router.post("/knowledge-sources/obsidian-sync")
+def sync_obsidian_knowledge_sources(
+    payload: ObsidianSyncRequest,
+    current_user: Row = Depends(get_current_user),
+    conn: Database = Depends(get_db),
+) -> dict:
+    """Import only the desktop-selected Vault's managed Markdown documents."""
+    workspace = get_workspace_for_user(conn, current_user["id"])
+    if workspace is None:
+        raise HTTPException(status_code=404, detail="工作区不存在")
+    result = sync_obsidian_documents(
+        conn,
+        workspace_id=workspace["id"],
+        created_by=current_user["id"],
+        documents=[document.model_dump() for document in payload.documents],
+    )
+    result["origin"] = "obsidian"
+    result["managed_area"] = ".agentpulse/managed"
+    return result
 
 
 @router.post("/conversations/group")
@@ -1205,11 +1242,16 @@ def list_conversation_runs(
     ).fetchall()
 
     result = []
+    from app.services.company_memory import get_run_context_summary
+
     for run in runs:
         steps = conn.execute(
             "SELECT * FROM run_steps WHERE run_id = ? ORDER BY created_at, id",
             (run["id"],),
         ).fetchall()
+        context = get_run_context_summary(
+            conn, workspace_id=workspace["id"], run_id=run["id"]
+        )
         result.append(
             RunOut(
                 id=run["id"],
@@ -1223,6 +1265,9 @@ def list_conversation_runs(
                 created_at=run["created_at"],
                 completed_at=run["completed_at"],
                 waiting_on=_waiting_on_text(conn, run["id"], run["status"]),
+                context_manifest_id=run.get("context_manifest_id"),
+                context_event_ids=context["event_ids"],
+                context_memory_ids=context["memory_ids"],
                 steps=[
                     RunStepOut(
                         id=step["id"],
@@ -1301,6 +1346,23 @@ def resolve_approval(
             approval_id,
             workspace["id"],
         ),
+    )
+
+    from app.services.company_memory import record_company_event
+
+    record_company_event(
+        conn,
+        workspace_id=workspace["id"],
+        event_type="decision",
+        source_id=approval_id,
+        title="审批决定",
+        content=f"{approval['title']}：{decision}",
+        conversation_id=approval["conversation_id"],
+        task_id=approval["task_id"],
+        actor_agent_id=approval["agent_id"],
+        actor_user_id=current_user["id"],
+        importance=4.0,
+        metadata={"approval_type": approval["type"], "status": decision},
     )
 
     # TD-11: this endpoint records the durable decision only. The suspended
@@ -1423,6 +1485,21 @@ def answer_clarification(
         "WHERE id = ?",
         (current_user["id"], now_iso(), approval_id),
     )
+    from app.services.company_memory import record_company_event
+
+    record_company_event(
+        conn,
+        workspace_id=workspace["id"],
+        event_type="decision",
+        source_id=approval_id,
+        title="澄清回答",
+        content=answer,
+        conversation_id=approval["conversation_id"],
+        task_id=approval["task_id"],
+        actor_user_id=current_user["id"],
+        importance=4.0,
+        metadata={"approval_type": "clarification", "status": "answered"},
+    )
     if approval["conversation_id"]:
         add_message(
             conn,
@@ -1493,13 +1570,20 @@ def capture_agent_experience_from_approval(
     )
 
 
-def _build_hermes_prompt(user_message: Row, discussion_context: str) -> str:
+def _build_hermes_prompt(
+    user_message: Row, discussion_context: str, cognitive_context: str = ""
+) -> str:
     """Prompt fed to a Hermes employee. Persona comes from the profile's SOUL;
     this carries the situational context + the boss's message."""
     latest = user_message["content"]
+    sections = []
+    if cognitive_context:
+        sections.append("【本次相关公司记忆】\n" + cognitive_context[:48000])
     if discussion_context:
-        return f"{discussion_context}\n\n老板刚说：{latest}\n\n请以你的角色简洁发言。"
-    return latest
+        sections.append("【当前讨论】\n" + discussion_context)
+    sections.append("【当前同事提出的信息】\n" + latest)
+    sections.append("请以你的姓名和岗位身份，基于事实和专业判断简洁发言；不要提及运行时实现。")
+    return "\n\n".join(sections)
 
 
 async def _stream_hermes_reply(
@@ -1514,15 +1598,26 @@ async def _stream_hermes_reply(
 ) -> AsyncGenerator:
     """真 Hermes 执行路径（流式）——唯一能触发 ADR 0008 审批门的路径。"""
     logger.info("agent_reply_via_hermes", agent_id=agent["id"], profile=profile)
+    context_manifest = _build_context_manifest(
+        conn,
+        workspace=workspace,
+        conversation=conversation,
+        agent=agent,
+        current_text=user_message["content"],
+        discussion_context=discussion_context,
+    )
     work_root = os.path.abspath(settings.hermes_work_root or ".hermes-data")
     ctx = RunContext(
         run_id="",
-        prompt=_build_hermes_prompt(user_message, discussion_context),
+        prompt=_build_hermes_prompt(
+            user_message, discussion_context, context_manifest["text"]
+        ),
         workdir=os.path.join(work_root, profile, "work", "runs", new_id("run")),
         profile=profile,
         agent_id=agent["id"],
         workspace_id=workspace["id"],
         conversation_id=conversation["id"],
+        context_manifest_id=context_manifest["id"],
     )
     async for event in stream_agent_run(
         conn,
@@ -1541,6 +1636,7 @@ async def _run_action_bridge_stream(
     conversation: Row,
     agent: Row,
     user_message: Row,
+    discussion_context: str = "",
 ) -> AsyncGenerator:
     """Agent Action Bridge（流式）：function-calling loop。
 
@@ -1556,6 +1652,14 @@ async def _run_action_bridge_stream(
         agent_id=agent["id"],
         query=user_message["content"],
     )
+    context_manifest = _build_context_manifest(
+        conn,
+        workspace=workspace,
+        conversation=conversation,
+        agent=agent,
+        current_text=user_message["content"],
+        discussion_context=discussion_context,
+    )
     tool_chunks: list[str] = []
     async for ev in run_function_loop(
         conn=conn,
@@ -1568,6 +1672,7 @@ async def _run_action_bridge_stream(
         related_tasks=related_tasks,
         knowledge_sources=knowledge_sources,
         agent_experiences=agent_experiences,
+        cognitive_context=context_manifest["text"],
     ):
         yield ev
         if ev["type"] == "chunk":
@@ -1653,6 +1758,7 @@ async def _stream_reply_events(
                 conversation=conversation,
                 agent=agent,
                 user_message=user_message,
+                discussion_context=discussion_context,
             ):
                 if ev["type"] == "tool_call":
                     bridge_used_tool = True
@@ -1736,6 +1842,14 @@ async def _stream_agent_reply(
         agent_id=agent["id"],
         query=latest_user_content,
     )
+    context_manifest = _build_context_manifest(
+        conn,
+        workspace=workspace,
+        conversation=conversation,
+        agent=agent,
+        current_text=latest_user_content or user_message["content"],
+        discussion_context=discussion_context,
+    )
 
     request = LlmChatRequest(
         company_name=workspace["name"],
@@ -1753,6 +1867,8 @@ async def _stream_agent_reply(
         knowledge_sources=knowledge_sources,
         agent_experiences=agent_experiences,
         discussion_context=discussion_context,
+        cognitive_context=context_manifest["text"],
+        context_manifest_id=context_manifest["id"],
     )
 
     return deepseek_client_for_workspace(conn, workspace["id"]).complete_stream(request)
@@ -1851,15 +1967,29 @@ async def _complete_hermes_reply(
     """真 Hermes 执行路径（非流式）——与 _stream_hermes_reply 同一条路径，
     只收集最终 message。"""
     logger.info("agent_reply_via_hermes", agent_id=agent["id"], profile=profile)
+    conversation = conn.execute(
+        "SELECT * FROM conversations WHERE id = ?", (conversation_id,)
+    ).fetchone()
+    context_manifest = _build_context_manifest(
+        conn,
+        workspace=workspace,
+        conversation=conversation,
+        agent=agent,
+        current_text=user_message["content"],
+        discussion_context=discussion_context,
+    )
     work_root = os.path.abspath(settings.hermes_work_root or ".hermes-data")
     ctx = RunContext(
         run_id="",
-        prompt=_build_hermes_prompt(user_message, discussion_context),
+        prompt=_build_hermes_prompt(
+            user_message, discussion_context, context_manifest["text"]
+        ),
         workdir=os.path.join(work_root, profile, "work", "runs", new_id("run")),
         profile=profile,
         agent_id=agent["id"],
         workspace_id=workspace["id"],
         conversation_id=conversation_id,
+        context_manifest_id=context_manifest["id"],
     )
     final_message = None
     async for event in stream_agent_run(
@@ -1918,6 +2048,13 @@ async def complete_agent_reply(
             agent_id=agent["id"],
             query=user_message["content"],
         )
+        context_manifest = _build_context_manifest(
+            conn,
+            workspace=workspace,
+            conversation=conversation,
+            agent=agent,
+            current_text=user_message["content"],
+        )
         try:
             tool_chunks: list[str] = []
             async for ev in run_function_loop(
@@ -1931,6 +2068,7 @@ async def complete_agent_reply(
                 related_tasks=related_tasks,
                 knowledge_sources=knowledge_sources,
                 agent_experiences=agent_experiences,
+                cognitive_context=context_manifest["text"],
             ):
                 if ev["type"] == "chunk":
                     tool_chunks.append(ev["content"])

@@ -60,6 +60,12 @@ class LlmChatRequest(BaseModel):
         max_length=4000,
         description="Group discussion context: other members, what they've said, role-based constraints",
     )
+    cognitive_context: str = Field(
+        default="",
+        max_length=48000,
+        description="Evidence-backed company memory selected for this turn",
+    )
+    context_manifest_id: str | None = Field(default=None, max_length=80)
 
 
 class LlmChatResponse(BaseModel):
@@ -105,3 +111,6 @@ class RunOut(BaseModel):
         "run trace already carries without requiring a click-through.",
     )
     steps: list[RunStepOut] = Field(default_factory=list)
+    context_manifest_id: str | None = None
+    context_event_ids: list[str] = Field(default_factory=list)
+    context_memory_ids: list[str] = Field(default_factory=list)

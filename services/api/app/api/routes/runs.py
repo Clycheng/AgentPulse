@@ -3,6 +3,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from app.api.deps import get_workspace_id
 from app.core.database import Database, get_db
 from app.runtime.deepseek import (
+    DeepSeekChatClient,
     DeepSeekAPIError,
     DeepSeekNotConfigured,
 )

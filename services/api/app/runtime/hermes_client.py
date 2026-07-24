@@ -60,6 +60,7 @@ class RunContext:
     workspace_id: str = ""
     conversation_id: str = ""
     task_id: str = ""
+    context_manifest_id: str | None = None
     mcp_servers: list[dict] = field(default_factory=list)
     environment: dict[str, str] = field(default_factory=dict)
     timeout: int = 600

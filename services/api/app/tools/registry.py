@@ -63,10 +63,10 @@ TOOLS: list[dict[str, Any]] = [
         "function": {
             "name": "create_employee",
             "description": (
-                "创建一个新的AI员工。用自然语言描述你想要什么样的员工，"
+                "创建一个新的员工。用自然语言描述你想要什么样的员工，"
                 "系统会分配角色和技能。你可以一次创建多个员工来组建团队。"
                 "创建后员工需要经过配置才能开始工作，但可以立即和ta聊天。"
-                "如果老板描述的职责涉及真实操作（读写文件、跑代码、查数据、"
+                "如果公司参与者描述的职责涉及真实操作（读写文件、跑代码、查数据、"
                 "分析统计等），先调用 list_capabilities 看目录里有没有对应的"
                 "能力，把匹配的 key 填进 capability_keys——不填的话这个员工"
                 "只能聊天，干不了实际工作。"
@@ -84,7 +84,7 @@ TOOLS: list[dict[str, Any]] = [
                     },
                     "description": {
                         "type": "string",
-                        "description": "员工的职责描述，帮老板做什么",
+                        "description": "员工的职责描述，帮助公司推进什么",
                     },
                     "department": {
                         "type": "string",
@@ -99,10 +99,10 @@ TOOLS: list[dict[str, Any]] = [
                         "type": "array",
                         "items": {"type": "string"},
                         "description": (
-                            "从老板的描述里拆出来的具体职责清单，每条一句话，"
+                            "从当前发起人的描述里拆出来的具体职责清单，每条一句话，"
                             "例如：[\"逐一核查上门打卡照片，核查服务真实性\", "
                             "\"制作项目台账、工程量统计表\"]。写不清楚就写老板"
-                            "原话里那一段，不要替他编造没提过的内容。"
+                            "原话里那一段，不要替发起人编造没提过的内容。"
                         ),
                     },
                     "capability_keys": {
@@ -126,7 +126,7 @@ TOOLS: list[dict[str, Any]] = [
             "name": "list_capabilities",
             "description": (
                 "列出系统里所有可授予员工的能力目录（key、说明、是否需要"
-                "老板配凭证）。创建员工前想给她真实工作能力时，先调这个看"
+                "需要配置业务凭证）。创建员工前想给她真实工作能力时，先调这个看"
                 "有哪些 key 可选，再把匹配的填进 create_employee 的"
                 "capability_keys。"
             ),
@@ -138,7 +138,7 @@ TOOLS: list[dict[str, Any]] = [
         "function": {
             "name": "create_task",
             "description": (
-                "创建一个新任务。老板直接交代的任务不需要 brief 确认。"
+                "创建一个新任务。公司参与者直接提出的任务不需要 brief 确认。"
                 "分配给指定员工。设置 bypass_gate=true 跳过共识门控。"
             ),
             "parameters": {
@@ -167,7 +167,7 @@ TOOLS: list[dict[str, Any]] = [
                     },
                     "bypass_gate": {
                         "type": "boolean",
-                        "description": "老板直接交代的任务设为true，跳过共识brief要求",
+                        "description": "公司参与者直接提出的任务设为true，跳过共识brief要求",
                         "default": True,
                     },
                 },
@@ -323,7 +323,7 @@ TOOLS: list[dict[str, Any]] = [
             "name": "send_group_message",
             "description": (
                 "在群聊里发消息。当你需要通知多个员工、发起讨论、"
-                "或者传达老板的决定时使用。"
+                "或者传达已经确认的公司决定时使用。"
             ),
             "parameters": {
                 "type": "object",
@@ -895,6 +895,7 @@ def system_prompt_for_operator(
     related_tasks: list | None = None,
     knowledge_sources: list | None = None,
     agent_experiences: list | None = None,
+    cognitive_context: str = "",
 ) -> str:
     """System prompt that tells the agent it can operate the system.
 
@@ -910,7 +911,8 @@ def system_prompt_for_operator(
     )
 
     return (
-        f"你是 {workspace_name} 的 AI 员工「{agent_name}」，岗位是{agent_role}。\n\n"
+        f"你是 {workspace_name} 中的同事「{agent_name}」，岗位是{agent_role}。\n"
+        "你基于公司目标和专业判断推进工作，不是某一个人的附属助手。\n\n"
         "你不仅能聊天，还能**直接操作公司系统**。你可以调用工具来：\n"
         "- 创建新员工（帮你招人、组建团队）\n"
         "- 创建任务（把工作分配给员工）\n"
@@ -920,13 +922,14 @@ def system_prompt_for_operator(
         f"{format_related_tasks(related_tasks or [])}\n"
         f"{format_knowledge_sources(knowledge_sources or [])}\n"
         f"{format_agent_experiences(agent_experiences or [])}\n\n"
+        f"【本次相关公司记忆】\n{cognitive_context or '暂无额外记忆'}\n\n"
         "**重要规则**：\n"
-        "1. 当老板说\"帮我招xxx\"、\"建一个团队\"、\"创建一个任务\"等操作指令时，你必须调用对应工具执行，"
+        "1. 当公司参与者明确要求招募、建团队或创建任务时，你必须调用对应工具执行，"
         "不要只说\"好的我帮你做\"然后不做。\n"
-        "2. 老板说\"帮我建一个完整的创业团队\"时，根据团队类型一口气创建多个员工。\n"
-        "3. 创建完员工后，主动告诉他们接下来可以做什么。\n"
+        "2. 公司参与者说\"帮我建一个完整的创业团队\"时，根据团队类型一口气创建多个员工。\n"
+        "3. 创建完员工后，主动告诉相关同事接下来可以做什么。\n"
         "4. 普通聊天时不需要调工具，用 no_action_needed。\n"
-        "5. 操作完成后用中文简洁汇报结果，让老板知道已经执行成功了。\n"
+        "5. 操作完成后用中文简洁汇报结果，让当前对话参与者知道已经执行成功了。\n"
         "6. 调工具前如果需要查员工ID，先调 list_agents。\n"
         "7. 所有回复用中文，专业直接。\n"
         "8. 如果有公司资料库上下文，优先结合资料里的品牌、业务、客户、流程等事实，不要编造资料中没有的公司事实。\n"

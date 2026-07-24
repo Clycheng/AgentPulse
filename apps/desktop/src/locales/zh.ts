@@ -235,6 +235,8 @@ const translations = {
     "title": "资料库与能力",
     "subtitle": "公司资料会进入员工回复上下文，让 AI 员工先理解你的业务再干活",
     "addSource": "新增资料",
+    "syncObsidian": "同步 Obsidian",
+    "syncingObsidian": "同步中…",
     "tabDocs": "公司资料库",
     "tabSkills": "Skills 技能",
     "tabMcp": "MCP 服务",

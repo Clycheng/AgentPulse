@@ -56,6 +56,9 @@ class TaskRunOut(BaseModel):
     completed_at: str | None
     steps: list[dict[str, Any]] = Field(default_factory=list)
     business_actions: list[dict[str, Any]] = Field(default_factory=list)
+    context_manifest_id: str | None = None
+    context_event_ids: list[str] = Field(default_factory=list)
+    context_memory_ids: list[str] = Field(default_factory=list)
 
 
 class ResumeTaskRequest(BaseModel):

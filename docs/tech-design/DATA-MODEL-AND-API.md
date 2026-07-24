@@ -453,7 +453,7 @@ def reload_gateway(self, profile_name: str) -> None:
 
 ### 10.4 公司工具边界
 
-`/mcp/company-tools/` 是 MCP streamable HTTP 端点。每 Run 的签名 token 绑定 workspace/plan/task/run/agent 与过期时间。六个工具为 `search_company_knowledge / report_progress / submit_output / create_subtask / request_support / block_task`；它们只调用服务层，Hermes 不持有数据库凭证，也不能改 brief 的目标、范围或成功标准。
+`/mcp/company-tools/` 是 MCP streamable HTTP 端点。每 Run 的签名 token 绑定 workspace/plan/task/run/agent 与过期时间。任务交付工具为 `search_company_knowledge / report_progress / submit_output / create_subtask / request_support / block_task`，公司认知工具为 `list_colleagues / search_company_memory / ping_colleague / send_internal_message / propose_internal_task / record_observation / report_relationship_fact`；它们只调用服务层，Hermes 不持有数据库凭证，也不能改 brief 的目标、范围或成功标准。
 
 ## 11. TD-10 受控业务动作【已实现】
 
@@ -483,3 +483,32 @@ def reload_gateway(self, profile_name: str) -> None:
 | GET/DELETE | `/api/agents/{id}/business-tool-policies[/{tool}]` | 查看/撤销员工级长期放行 |
 | POST/DELETE | `/api/agents/{id}/credentials[/{name}]` | 加密保存/撤销凭证并刷新依赖能力 |
 | POST | `/api/approvals/{id}/resolve` | business_tool 一次/长期批准或拒绝；API 不调用 provider |
+
+## 12. TD-13 公司世界模型与认知上下文【已实现基础闭环】
+
+### 12.1 持久表
+
+- `knowledge_sources` 的 `origin`（`manual|obsidian`）、`source_ref`（受控相对路径）和 `source_hash` 用于资料来源审计；Obsidian 原文不离开用户明确选择并同步的 managed 区域，更新不会覆盖本机 Vault。
+- `company_events`：workspace 隔离的不可变事实账本，覆盖消息、任务事件、产出、知识、决策和外部结果；`(workspace_id, event_type, source_id)` 幂等。
+- `agent_memories`：每员工的 `observation / episode / reflection / relationship / lesson` 投影；私有记忆只有所属员工可检索，共享记忆必须通过 `promoted` 标记。
+- `memory_links`：长期记忆到证据事件的多对多链接；没有证据的记忆不得晋升为共享事实。
+- `agent_relationships`：员工之间的合作摘要、可信度、互动次数和证据事件。
+- `context_manifests`：每次上下文构建的检索焦点、事件/记忆 ID、prompt hash、预算和可选 Run 关联。
+
+### 12.2 上下文与内部协作 API
+
+| 方法 | 路径 | 语义 |
+|---|---|---|
+| GET | `/api/memory/search?q=...&agent_id=...` | 按 workspace 检索共享事实与指定员工可见记忆 |
+| GET | `/api/agents/{id}/memory` | 员工记忆与证据事件 ID |
+| GET | `/api/agents/{id}/relationships` | 同事关系记忆 |
+| GET | `/api/runs/{id}/context` | Run 使用的 Context Manifest |
+| POST | `/api/agents/{id}/reflect` | 触发技能反思和证据记忆反思 |
+| POST | `/api/agents/{id}/ping` | 创建受限的员工间持久 DM |
+| GET | `/api/company-events` | 查看当前 workspace 的公司事件账本 |
+| POST | `/api/company-events/rebuild-index` | 回填历史消息、任务、产出和资料事件 |
+| POST | `/api/knowledge-sources/obsidian-sync` | 接收桌面端 `.agentpulse/managed` Markdown 索引并按路径幂等更新 |
+
+`/mcp/company-tools/` 另外提供 `list_colleagues / search_company_memory /
+ping_colleague / send_internal_message / propose_internal_task /
+record_observation / report_relationship_fact`。MCP 参数使用同事姓名和岗位语义，服务端再解析到内部员工记录；所有调用仍必须绑定任务 Run 和现有计划调整上限。

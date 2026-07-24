@@ -1,6 +1,7 @@
 import {
   app,
   BrowserWindow,
+  dialog,
   ipcMain,
   net,
   protocol,
@@ -124,6 +125,67 @@ function registerSessionIpc() {
   });
 }
 
+type ManagedObsidianDocument = {
+  relative_path: string;
+  title: string;
+  content: string;
+  modified_at: string;
+};
+
+function markdownTitle(filePath: string, content: string): string {
+  const heading = content.match(/^#\s+(.+)$/m)?.[1]?.trim();
+  return heading || path.basename(filePath, path.extname(filePath));
+}
+
+function readManagedObsidianDocuments(vaultPath: string): ManagedObsidianDocument[] {
+  const managedRoot = path.resolve(vaultPath, '.agentpulse', 'managed');
+  if (!fs.existsSync(managedRoot) || !fs.statSync(managedRoot).isDirectory()) {
+    return [];
+  }
+  const documents: ManagedObsidianDocument[] = [];
+  const visit = (directory: string) => {
+    if (documents.length >= 200) return;
+    for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
+      if (documents.length >= 200) return;
+      const absolute = path.join(directory, entry.name);
+      if (entry.isSymbolicLink()) continue;
+      if (entry.isDirectory()) {
+        visit(absolute);
+        continue;
+      }
+      if (!entry.isFile() || path.extname(entry.name).toLowerCase() !== '.md') continue;
+      const stat = fs.statSync(absolute);
+      if (stat.size > 100_000) continue;
+      const content = fs.readFileSync(absolute, 'utf8').trim();
+      if (!content) continue;
+      documents.push({
+        relative_path: path.relative(managedRoot, absolute).split(path.sep).join('/'),
+        title: markdownTitle(absolute, content),
+        content,
+        modified_at: stat.mtime.toISOString(),
+      });
+    }
+  };
+  visit(managedRoot);
+  return documents;
+}
+
+function registerObsidianIpc() {
+  ipcMain.handle('agentpulse:obsidian:pick-managed', async () => {
+    const result = await dialog.showOpenDialog({
+      title: '选择 Obsidian Vault',
+      properties: ['openDirectory'],
+    });
+    if (result.canceled || !result.filePaths[0]) return null;
+    const vaultPath = result.filePaths[0];
+    return {
+      vault_name: path.basename(vaultPath),
+      managed_area: '.agentpulse/managed',
+      documents: readManagedObsidianDocuments(vaultPath),
+    };
+  });
+}
+
 function registerAppProtocol() {
   protocol.handle('app', (request) => {
     const url = new URL(request.url);
@@ -188,6 +250,7 @@ async function createWindow() {
 
 app.whenReady().then(async () => {
   registerSessionIpc();
+  registerObsidianIpc();
   registerAppProtocol();
   session.defaultSession.setPermissionRequestHandler(
     (_webContents, _permission, callback) => {

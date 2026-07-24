@@ -5,6 +5,16 @@
 
 ## [Unreleased]
 
+### 2026-07-24（TD-13：公司世界模型与独立员工认知闭环）
+
+- **feat(memory)**：新增 workspace 隔离的 `company_events`、`agent_memories`、`memory_links`、`agent_relationships` 和 `context_manifests`。聊天/私聊、任务事件、产出、知识资料和员工经验在原写入事务中进入不可变公司事件账本；原文保留，旧 transcript 超过预算时生成带证据链接的 episode。
+- **feat(runtime)**：新增 Context Engine，按词法相关性、近因、重要性和可信度检索共享事实、员工私有记忆与同事关系，给 Hermes ACP、DeepSeek 和任务调度注入专属 manifest；Run、任务快照和会话 Run 轨迹返回使用过的事件/记忆 ID。
+- **feat(company-tools)**：`/mcp/company-tools` 新增同事列表、公司记忆检索、持久 ping/内部消息、范围内内部任务、观察和关系事实工具；MCP 面向员工使用姓名/岗位语义，服务端继续用 token 校验 workspace、Run、负责人和计划边界，重复 ping 会被拦截。
+- **feat(product)**：员工档案增加认知记忆、同事关系和证据审计区；手动/idle reflection 同时沉淀 evidence-backed reflection，私有判断不会作为共享记忆暴露。
+- **feat(obsidian)**：桌面端只读用户选择的 Vault 下 `.agentpulse/managed` Markdown，新增 `POST /api/knowledge-sources/obsidian-sync` 按工作区和相对路径幂等同步；不扫描或覆盖 Vault 其他内容，文档更新继续写入公司事件账本。
+- **test**：新增 TD-13 事件共享/私有隔离/上下文 manifest/overflow episode/ping loop/Obsidian managed sync/prompt 语义测试；全套 API **361 passed / 9 skipped**，desktop lint/build 通过。
+- **architecture**：新增 [ADR 0013](docs/decisions/0013-company-world-model-and-cognitive-memory.md) 与 [TD-13](docs/tech-design/TD-13-company-world-model.md)，明确数据库事实源、员工独立认知投影、Hermes 唯一运行时和现有外部审批门不变。
+
 ### 2026-07-24（TD-12：零成本云端部署与桌面分发闭环，进行中）
 
 - **feat(cloud/BYOK)**：新增 workspace 级 DeepSeek 模型凭证和设置 API；注册即创建四人内容团队与内容经营群，保存并验证 Key 后幂等供给全部员工，撤销后阻止新 Run。密钥使用独立 `credential_encryption_key` 派生的版本化 Fernet 密文，只按 Run 注入 Hermes ACP 环境，不写 profile、日志或 API 响应。

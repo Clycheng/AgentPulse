@@ -129,6 +129,8 @@ class KnowledgeSourceOut(BaseModel):
     created_by: str
     created_at: str
     updated_at: str
+    origin: str = "manual"
+    source_ref: str = ""
 
 
 class AgentTemplateOut(BaseModel):
@@ -207,6 +209,17 @@ class CreateKnowledgeSourceRequest(BaseModel):
     title: str = Field(min_length=1, max_length=160)
     category: str = Field(default="通用资料", max_length=80)
     content: str = Field(min_length=1, max_length=20000)
+
+
+class ObsidianDocumentIn(BaseModel):
+    relative_path: str = Field(min_length=1, max_length=500)
+    title: str = Field(min_length=1, max_length=160)
+    content: str = Field(min_length=1, max_length=100000)
+    modified_at: str | None = Field(default=None, max_length=80)
+
+
+class ObsidianSyncRequest(BaseModel):
+    documents: list[ObsidianDocumentIn] = Field(min_length=1, max_length=200)
 
 
 class CreateGroupRequest(BaseModel):

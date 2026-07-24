@@ -235,6 +235,8 @@ const translations = {
     "title": "Library & Capabilities",
     "subtitle": "Company knowledge is injected into employee replies, so they understand your business before acting",
     "addSource": "Add source",
+    "syncObsidian": "Sync Obsidian",
+    "syncingObsidian": "Syncing…",
     "tabDocs": "Company knowledge",
     "tabSkills": "Skills",
     "tabMcp": "MCP services",

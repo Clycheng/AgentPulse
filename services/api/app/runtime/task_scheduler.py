@@ -18,7 +18,7 @@ from app.runtime.runs import RunStatus
 from app.schemas.content_package import ContentPackageV1
 from app.services.content_packages import parse_content_package
 from app.services.task_plans import enqueue_task_run
-from app.services.workspace import add_task_event, new_id, now_iso
+from app.services.workspace import add_task_event, add_task_output, now_iso
 
 
 logger = get_logger(__name__)
@@ -130,6 +130,30 @@ class TaskScheduler:
             if row is None:
                 return
             prompt = self._build_task_prompt(conn, row)
+            workspace = conn.execute(
+                "SELECT * FROM workspaces WHERE id = ?", (row["workspace_id"],)
+            ).fetchone()
+            agent = conn.execute(
+                "SELECT a.*, d.name AS department_name FROM agents a "
+                "LEFT JOIN departments d ON d.id = a.department_id WHERE a.id = ?",
+                (row["agent_id"],),
+            ).fetchone()
+            conversation = conn.execute(
+                "SELECT * FROM conversations WHERE id = ?", (row["conversation_id"],)
+            ).fetchone()
+            context_manifest = None
+            if workspace and agent and conversation:
+                from app.services.company_memory import build_context_manifest
+
+                context_manifest = build_context_manifest(
+                    conn,
+                    workspace=workspace,
+                    conversation=conversation,
+                    agent=agent,
+                    current_text=prompt,
+                    task_id=row["task_id"],
+                )
+                prompt += "\n\n【本次工作相关的公司记忆】\n" + context_manifest["text"]
             token = create_company_tool_token(
                 workspace_id=row["workspace_id"],
                 plan_id=row["task_plan_id"],
@@ -146,6 +170,7 @@ class TaskScheduler:
                 workspace_id=row["workspace_id"],
                 conversation_id=row["conversation_id"],
                 task_id=row["task_id"],
+                context_manifest_id=context_manifest["id"] if context_manifest else None,
                 mcp_servers=[
                     {
                         "name": "agentpulse-company",
@@ -243,7 +268,7 @@ class TaskScheduler:
 预期交付：{run['expected_output']}
 交付类型：{run['output_type']}
 
-【老板补充】
+【补充信息】
 {input_message['content'] if input_message else '无'}
 
 【前置任务产出】
@@ -339,21 +364,15 @@ class TaskScheduler:
         self._refresh_plan(conn, run["task_plan_id"])
 
     def _save_markdown_fallback(self, conn: Database, run: dict, text: str) -> None:
-        conn.execute(
-            """INSERT INTO task_outputs (
-              id, workspace_id, task_id, conversation_id, agent_id, title,
-              output_type, content, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, 'markdown', ?, ?)""",
-            (
-                new_id("output"),
-                run["workspace_id"],
-                run["task_id"],
-                run["conversation_id"],
-                run["agent_id"],
-                run["task_title"],
-                text,
-                now_iso(),
-            ),
+        add_task_output(
+            conn,
+            workspace_id=run["workspace_id"],
+            task_id=run["task_id"],
+            conversation_id=run["conversation_id"],
+            agent_id=run["agent_id"],
+            title=run["task_title"],
+            output_type="markdown",
+            content=text,
         )
 
     def _retry_or_block(

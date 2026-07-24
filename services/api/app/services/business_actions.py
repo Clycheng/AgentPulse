@@ -28,6 +28,39 @@ class BusinessToolError(ValueError):
     pass
 
 
+def _record_external_action_event(
+    conn: Database,
+    action: dict,
+    *,
+    status: str,
+    content: str,
+    source_suffix: str,
+    metadata: dict | None = None,
+) -> None:
+    """Project a provider result into the immutable company event ledger."""
+    from app.services.company_memory import record_company_event
+
+    record_company_event(
+        conn,
+        workspace_id=action["workspace_id"],
+        event_type="external_action_result",
+        source_id=f"{action['id']}:{source_suffix}",
+        title=f"外部动作{status}",
+        content=content[:12000],
+        conversation_id=action.get("conversation_id"),
+        task_id=action.get("task_id"),
+        actor_agent_id=action.get("agent_id"),
+        importance=4.0 if status == "succeeded" else 3.0,
+        metadata={
+            "action_id": action["id"],
+            "tool_name": action["tool_name"],
+            "provider": action.get("provider"),
+            "status": status,
+            **(metadata or {}),
+        },
+    )
+
+
 def _iso_after(seconds: float) -> str:
     return (datetime.now(UTC) + timedelta(seconds=seconds)).isoformat()
 
@@ -523,7 +556,7 @@ class BusinessActionWorker:
 
     def _claim(self, conn: Database) -> list[str]:
         rows = conn.execute(
-            """SELECT id, attempt_no, run_id FROM business_actions
+            """SELECT * FROM business_actions
             WHERE status = 'approved' OR (
               status = 'executing' AND lease_expires_at < ?
             ) ORDER BY created_at LIMIT 8""",
@@ -543,6 +576,14 @@ class BusinessActionWorker:
                     "UPDATE runs SET status = 'running' "
                     "WHERE id = ? AND status = 'waiting_user'",
                     (row["run_id"],),
+                )
+                _record_external_action_event(
+                    conn,
+                    dict(row),
+                    status="failed",
+                    content="业务动作重试次数已用尽",
+                    source_suffix=f"attempt-{row['attempt_no']}",
+                    metadata={"attempt_no": row["attempt_no"], "terminal": True},
                 )
                 continue
             conn.execute(
@@ -616,6 +657,14 @@ class BusinessActionWorker:
                 "UPDATE runs SET status = 'running' WHERE id = ? AND status = 'waiting_user'",
                 (action["run_id"],),
             )
+            _record_external_action_event(
+                conn,
+                dict(action),
+                status="succeeded",
+                content=json.dumps(result, ensure_ascii=False),
+                source_suffix="succeeded",
+                metadata={"external_id": result.get("id")},
+            )
             conn.commit()
         except Exception as exc:
             conn.rollback()
@@ -627,7 +676,7 @@ class BusinessActionWorker:
         conn = connect()
         try:
             action = conn.execute(
-                "SELECT attempt_no, run_id FROM business_actions WHERE id = ?",
+                "SELECT * FROM business_actions WHERE id = ?",
                 (action_id,),
             ).fetchone()
             if action is None:
@@ -645,6 +694,14 @@ class BusinessActionWorker:
                     "UPDATE runs SET status = 'running' WHERE id = ? AND status = 'waiting_user'",
                     (action["run_id"],),
                 )
+            _record_external_action_event(
+                conn,
+                dict(action),
+                status="failed" if terminal else "retrying",
+                content=error,
+                source_suffix=f"attempt-{action['attempt_no']}",
+                metadata={"attempt_no": action["attempt_no"], "terminal": terminal},
+            )
             conn.commit()
         except Exception as exc:
             conn.rollback()

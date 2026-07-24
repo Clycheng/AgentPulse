@@ -136,3 +136,14 @@
 | Hermes 执行接入 | [TD-03](TD-03-hermes-execution.md) | 已拆 task，含待核 |
 | agent 供给(NL→agent) | [TD-04](TD-04-agent-provisioning.md) | 已拆 task(逻辑/物理供给分段，ProfileProvisioner 接缝切在待核边界) |
 | 能力映射表 capability_catalog | [TD-05](TD-05-capability-catalog.md) | 已拆 task(代码常量+risk_gate 只升不降) |
+
+## 10. TD-13 公司认知层
+
+公司事件账本位于运行时与产品层之间：产品写入消息、任务、资料、产出和决策时同步投影不可变 `company_events`；Context Engine 在 Hermes ACP 或 DeepSeek 调用前从共享事件、员工私有记忆、同事关系和资料索引中检索并持久化 `context_manifests`。Hermes profile 继续保存员工人格、技能和运行时记忆，但不作为跨员工事实源。
+
+员工间 MCP 只提供受 token 绑定的公司内协作能力。姓名/岗位语义在 MCP 契约层传递，服务端解析并校验内部员工记录；重复 ping、无新事实循环和计划范围调整仍由 AgentPulse 的持久服务层治理。反思 worker 先使用证据保留的确定性压缩，未来可替换为 Hermes 生成式总结而无需改变数据和权限边界。
+
+Obsidian 集成位于桌面资料层：Electron 主进程让用户选择 Vault 后，只读取
+`.agentpulse/managed/**/*.md`，renderer 将正文和相对路径提交到
+`/api/knowledge-sources/obsidian-sync`。API 以 `workspace_id + origin + source_ref`
+幂等更新资料索引，既不上传 Vault 其他目录，也不向本机回写文件。

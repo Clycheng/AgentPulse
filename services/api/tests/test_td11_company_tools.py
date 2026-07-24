@@ -238,7 +238,7 @@ def test_mcp_streamable_http_requires_token_and_lists_company_tools(tmp_path, mo
         )
         assert listed.status_code == 200, listed.text
         names = {tool["name"] for tool in listed.json()["result"]["tools"]}
-        assert names == {
+        assert names >= {
             "search_company_knowledge", "report_progress", "submit_output",
             "create_subtask", "request_support", "block_task",
         }

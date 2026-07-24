@@ -6,11 +6,32 @@ import json
 
 from app.core.database import Database
 from app.services.content_packages import parse_content_package
-from app.services.workspace import add_task_event, create_task, new_id, now_iso
+from app.services.workspace import add_task_event, add_task_output, create_task, new_id, now_iso
 
 
 class CompanyToolError(ValueError):
     pass
+
+
+def _assert_colleague(conn: Database, workspace_id: str, agent_id: str) -> dict:
+    row = conn.execute(
+        "SELECT id, name, role, description FROM agents WHERE id = ? AND workspace_id = ?",
+        (agent_id, workspace_id),
+    ).fetchone()
+    if row is None:
+        raise CompanyToolError("同事不存在或不属于当前公司")
+    return dict(row)
+
+
+def _resolve_colleague_name(conn: Database, workspace_id: str, name: str) -> dict:
+    rows = conn.execute(
+        """SELECT id, name, role, description FROM agents
+        WHERE workspace_id = ? AND name = ?""",
+        (workspace_id, name.strip()),
+    ).fetchall()
+    if len(rows) != 1:
+        raise CompanyToolError("请使用唯一的同事姓名；找不到或存在重名")
+    return dict(rows[0])
 
 
 def authorize_run(conn: Database, claims: dict) -> dict:
@@ -63,6 +84,288 @@ def search_company_knowledge(
     ]
 
 
+def list_colleagues(conn: Database, claims: dict) -> list[dict]:
+    authorize_run(conn, claims)
+    rows = conn.execute(
+        """SELECT id, name, role, description, status_label FROM agents
+        WHERE workspace_id = ? AND id <> ? ORDER BY created_at, id""",
+        (claims["workspace_id"], claims["agent_id"]),
+    ).fetchall()
+    return [
+        {
+            "name": row["name"],
+            "role": row["role"],
+            "description": row["description"],
+            "status": row["status_label"],
+        }
+        for row in rows
+    ]
+
+
+def search_company_memory_for_run(
+    conn: Database, claims: dict, *, query: str, limit: int = 8
+) -> list[dict]:
+    authorize_run(conn, claims)
+    from app.services.company_memory import search_company_memory
+
+    selected = search_company_memory(
+        conn,
+        workspace_id=claims["workspace_id"],
+        query=query,
+        agent_id=claims["agent_id"],
+        limit=limit,
+    )
+    hidden = {"workspace_id", "agent_id", "actor_agent_id", "actor_user_id"}
+    return [{key: value for key, value in item.items() if key not in hidden} for item in selected]
+
+
+def ping_colleague(
+    conn: Database,
+    claims: dict,
+    *,
+    to_agent_id: str,
+    content: str,
+) -> dict:
+    authorize_run(conn, claims)
+    _assert_colleague(conn, claims["workspace_id"], to_agent_id)
+    from app.services.company_memory import send_internal_ping
+
+    return send_internal_ping(
+        conn,
+        workspace_id=claims["workspace_id"],
+        from_agent_id=claims["agent_id"],
+        to_agent_id=to_agent_id,
+        content=content,
+        run_id=claims["run_id"],
+    )
+
+
+def ping_colleague_by_name(
+    conn: Database, claims: dict, *, to_colleague_name: str, content: str
+) -> dict:
+    colleague = _resolve_colleague_name(
+        conn, claims["workspace_id"], to_colleague_name
+    )
+    result = ping_colleague(
+        conn,
+        claims,
+        to_agent_id=colleague["id"],
+        content=content,
+    )
+    return {"ok": True, "delivered_to": colleague["name"], "message_id": result["message_id"]}
+
+
+def record_observation(
+    conn: Database, claims: dict, *, title: str, content: str, promoted: bool = False
+) -> dict:
+    authorize_run(conn, claims)
+    from app.services.company_memory import record_company_event, record_memory
+
+    event = record_company_event(
+        conn,
+        workspace_id=claims["workspace_id"],
+        event_type="agent_observation",
+        source_id=f"{claims['run_id']}:{new_id('observation')}",
+        title=title,
+        content=content,
+        task_id=claims["task_id"],
+        actor_agent_id=claims["agent_id"],
+        importance=2.0,
+        metadata={"run_id": claims["run_id"]},
+    )
+    memory = record_memory(
+        conn,
+        workspace_id=claims["workspace_id"],
+        agent_id=claims["agent_id"],
+        memory_type="observation",
+        title=title,
+        content=content,
+        evidence_event_ids=[event["id"]],
+        importance=2.0,
+        confidence=0.8,
+        is_private=not promoted,
+        promoted=promoted,
+    )
+    return {"ok": True, "event_id": event["id"], "memory_id": memory["id"]}
+
+
+def report_relationship_fact(
+    conn: Database,
+    claims: dict,
+    *,
+    colleague_agent_id: str,
+    fact: str,
+) -> dict:
+    authorize_run(conn, claims)
+    colleague = _assert_colleague(conn, claims["workspace_id"], colleague_agent_id)
+    from app.services.company_memory import record_company_event, record_memory
+
+    event = record_company_event(
+        conn,
+        workspace_id=claims["workspace_id"],
+        event_type="relationship_fact",
+        source_id=f"{claims['run_id']}:{colleague_agent_id}:{new_id('fact')}",
+        title=f"与 {colleague['name']} 的协作事实",
+        content=fact,
+        task_id=claims["task_id"],
+        actor_agent_id=claims["agent_id"],
+        importance=2.0,
+        metadata={"colleague_agent_id": colleague_agent_id},
+    )
+    memory = record_memory(
+        conn,
+        workspace_id=claims["workspace_id"],
+        agent_id=claims["agent_id"],
+        memory_type="relationship",
+        title=f"与 {colleague['name']} 的合作经验",
+        content=fact,
+        evidence_event_ids=[event["id"]],
+        importance=2.5,
+        confidence=0.75,
+    )
+    existing = conn.execute(
+        """SELECT * FROM agent_relationships
+        WHERE workspace_id = ? AND agent_id = ? AND colleague_agent_id = ?""",
+        (claims["workspace_id"], claims["agent_id"], colleague_agent_id),
+    ).fetchone()
+    if existing is None:
+        conn.execute(
+            """INSERT INTO agent_relationships (
+              id, workspace_id, agent_id, colleague_agent_id, summary,
+              trust_score, interaction_count, evidence_event_ids_json,
+              last_interacted_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, 0.6, 1, ?, ?, ?)""",
+            (
+                new_id("rel"),
+                claims["workspace_id"],
+                claims["agent_id"],
+                colleague_agent_id,
+                fact[:500],
+                json.dumps([event["id"]], ensure_ascii=False),
+                now_iso(),
+                now_iso(),
+            ),
+        )
+    else:
+        try:
+            evidence = json.loads(existing["evidence_event_ids_json"] or "[]")
+        except (TypeError, ValueError):
+            evidence = []
+        conn.execute(
+            """UPDATE agent_relationships SET summary = ?,
+            interaction_count = interaction_count + 1,
+            evidence_event_ids_json = ?, last_interacted_at = ?, updated_at = ?
+            WHERE id = ?""",
+            (
+                fact[:500],
+                json.dumps((evidence + [event["id"]])[-20:], ensure_ascii=False),
+                now_iso(),
+                now_iso(),
+                existing["id"],
+            ),
+        )
+    return {"ok": True, "event_id": event["id"], "memory_id": memory["id"]}
+
+
+def report_relationship_fact_by_name(
+    conn: Database, claims: dict, *, colleague_name: str, fact: str
+) -> dict:
+    colleague = _resolve_colleague_name(conn, claims["workspace_id"], colleague_name)
+    return report_relationship_fact(
+        conn,
+        claims,
+        colleague_agent_id=colleague["id"],
+        fact=fact,
+    )
+
+
+def propose_internal_task(
+    conn: Database,
+    claims: dict,
+    *,
+    title: str,
+    description: str,
+    owner_agent_id: str,
+    expected_output: str,
+) -> dict:
+    _assert_colleague(conn, claims["workspace_id"], owner_agent_id)
+    return create_subtask(
+        conn,
+        claims,
+        title=title,
+        description=description,
+        owner_agent_id=owner_agent_id,
+        expected_output=expected_output,
+        output_type="markdown",
+    )
+
+
+def propose_internal_task_by_name(
+    conn: Database,
+    claims: dict,
+    *,
+    title: str,
+    description: str,
+    owner_colleague_name: str,
+    expected_output: str,
+) -> dict:
+    colleague = _resolve_colleague_name(
+        conn, claims["workspace_id"], owner_colleague_name
+    )
+    return propose_internal_task(
+        conn,
+        claims,
+        title=title,
+        description=description,
+        owner_agent_id=colleague["id"],
+        expected_output=expected_output,
+    )
+
+
+def request_support_by_name(
+    conn: Database,
+    claims: dict,
+    *,
+    colleague_name: str,
+    request: str,
+    expected_output: str,
+) -> dict:
+    colleague = _resolve_colleague_name(conn, claims["workspace_id"], colleague_name)
+    return request_support(
+        conn,
+        claims,
+        agent_id=colleague["id"],
+        request=request,
+        expected_output=expected_output,
+    )
+
+
+def create_subtask_by_name(
+    conn: Database,
+    claims: dict,
+    *,
+    title: str,
+    description: str,
+    owner_colleague_name: str,
+    expected_output: str,
+    output_type: str = "markdown",
+    depends_on_task_ids: list[str] | None = None,
+) -> dict:
+    colleague = _resolve_colleague_name(
+        conn, claims["workspace_id"], owner_colleague_name
+    )
+    return create_subtask(
+        conn,
+        claims,
+        title=title,
+        description=description,
+        owner_agent_id=colleague["id"],
+        expected_output=expected_output,
+        output_type=output_type,
+        depends_on_task_ids=depends_on_task_ids,
+    )
+
+
 def report_progress(
     conn: Database, claims: dict, *, progress: int, summary: str
 ) -> dict:
@@ -107,23 +410,15 @@ def submit_output(
             raise CompanyToolError("markdown output cannot be empty")
     else:
         serialized = content if isinstance(content, str) else json.dumps(content, ensure_ascii=False)
-    output_id = new_id("output")
-    conn.execute(
-        """INSERT INTO task_outputs (
-          id, workspace_id, task_id, conversation_id, agent_id, title,
-          output_type, content, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-        (
-            output_id,
-            claims["workspace_id"],
-            claims["task_id"],
-            run["conversation_id"],
-            claims["agent_id"],
-            title[:160],
-            output_type,
-            serialized,
-            now_iso(),
-        ),
+    output = add_task_output(
+        conn,
+        workspace_id=claims["workspace_id"],
+        task_id=claims["task_id"],
+        conversation_id=run["conversation_id"],
+        agent_id=claims["agent_id"],
+        title=title[:160],
+        output_type=output_type,
+        content=serialized,
     )
     add_task_event(
         conn,
@@ -135,7 +430,7 @@ def submit_output(
         title="员工提交产出",
         content=title[:160],
     )
-    return {"ok": True, "output_id": output_id, "output_type": output_type}
+    return {"ok": True, "output_id": output["id"], "output_type": output_type}
 
 
 def _consume_revision(conn: Database, plan_id: str) -> int:

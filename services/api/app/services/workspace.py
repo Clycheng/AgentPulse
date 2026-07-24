@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+import hashlib
 import json
 import re
 from uuid import uuid4
@@ -68,6 +69,28 @@ def now_iso() -> str:
 
 def new_id(prefix: str) -> str:
     return f"{prefix}_{uuid4().hex}"
+
+
+def _project_company_event(conn: Database, callback) -> None:
+    """Project a legacy write only when the TD-13 ledger exists.
+
+    A few low-level unit tests intentionally build a minimal pre-TD-13 schema.
+    Production databases always run the startup migration, so missing the table
+    is the only condition that is safe to ignore here; real projection errors
+    must still abort the surrounding transaction.
+    """
+    try:
+        conn.execute("SELECT 1 FROM company_events LIMIT 1")
+    except Exception as exc:
+        message = str(exc).lower()
+        if "company_events" in message and (
+            "no such table" in message
+            or "does not exist" in message
+            or "undefined table" in message
+        ):
+            return
+        raise
+    callback()
 
 
 def create_workspace_for_user(
@@ -395,7 +418,14 @@ def add_message(
         "UPDATE conversations SET updated_at = ? WHERE id = ?",
         (created_at, conversation_id),
     )
-    return conn.execute("SELECT * FROM messages WHERE id = ?", (message_id,)).fetchone()
+    row = conn.execute("SELECT * FROM messages WHERE id = ?", (message_id,)).fetchone()
+    _project_company_event(
+        conn,
+        lambda: __import__(
+            "app.services.company_memory", fromlist=["record_message_event"]
+        ).record_message_event(conn, row),
+    )
+    return row
 
 
 def serialize_workspace(row: Row) -> dict:
@@ -505,6 +535,8 @@ def serialize_knowledge_source(row: Row) -> dict:
         "created_by": row["created_by"],
         "created_at": row["created_at"],
         "updated_at": row["updated_at"],
+        "origin": row.get("origin") or "manual",
+        "source_ref": row.get("source_ref") or "",
     }
 
 
@@ -601,7 +633,14 @@ def add_task_event(
             created_at,
         ),
     )
-    return conn.execute("SELECT * FROM task_events WHERE id = ?", (event_id,)).fetchone()
+    row = conn.execute("SELECT * FROM task_events WHERE id = ?", (event_id,)).fetchone()
+    _project_company_event(
+        conn,
+        lambda: __import__(
+            "app.services.company_memory", fromlist=["record_task_event_projection"]
+        ).record_task_event_projection(conn, row),
+    )
+    return row
 
 
 def add_task_output(
@@ -637,7 +676,14 @@ def add_task_output(
             created_at,
         ),
     )
-    return conn.execute("SELECT * FROM task_outputs WHERE id = ?", (output_id,)).fetchone()
+    row = conn.execute("SELECT * FROM task_outputs WHERE id = ?", (output_id,)).fetchone()
+    _project_company_event(
+        conn,
+        lambda: __import__(
+            "app.services.company_memory", fromlist=["record_task_event_projection"]
+        ).record_task_event_projection(conn, row, event_type="task_output"),
+    )
+    return row
 
 
 def add_agent_experience(
@@ -671,9 +717,37 @@ def add_agent_experience(
             created_at,
         ),
     )
-    return conn.execute(
+    row = conn.execute(
         "SELECT * FROM agent_experiences WHERE id = ?", (experience_id,)
     ).fetchone()
+    def project() -> None:
+        from app.services.company_memory import record_company_event, record_memory
+
+        event = record_company_event(
+            conn,
+            workspace_id=workspace_id,
+            event_type="agent_experience",
+            source_id=experience_id,
+            title="员工工作经验",
+            content=f"{summary}\n{lessons}".strip(),
+            task_id=task_id,
+            actor_agent_id=agent_id,
+            importance=3.0,
+            metadata={"outcome": outcome},
+        )
+        record_memory(
+            conn,
+            workspace_id=workspace_id,
+            agent_id=agent_id,
+            memory_type="lesson" if outcome != "success" else "episode",
+            title="成功经验" if outcome == "success" else "复盘教训",
+            content=f"{summary}\n{lessons}".strip(),
+            evidence_event_ids=[event["id"]],
+            importance=3.0,
+            confidence=0.9,
+        )
+    _project_company_event(conn, project)
+    return row
 
 
 def create_knowledge_source(
@@ -684,6 +758,9 @@ def create_knowledge_source(
     category: str,
     content: str,
     created_by: str,
+    origin: str = "manual",
+    source_ref: str = "",
+    source_hash: str = "",
 ) -> Row:
     source_id = new_id("ks")
     created_at = now_iso()
@@ -691,9 +768,10 @@ def create_knowledge_source(
     conn.execute(
         """
         INSERT INTO knowledge_sources (
-          id, workspace_id, title, category, content, created_by, created_at, updated_at
+          id, workspace_id, title, category, content, created_by, origin,
+          source_ref, source_hash, created_at, updated_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             source_id,
@@ -702,13 +780,107 @@ def create_knowledge_source(
             normalized_category,
             content.strip(),
             created_by,
+            origin,
+            source_ref,
+            source_hash,
             created_at,
             created_at,
         ),
     )
-    return conn.execute(
+    row = conn.execute(
         "SELECT * FROM knowledge_sources WHERE id = ?", (source_id,)
     ).fetchone()
+    _project_company_event(
+        conn,
+        lambda: __import__(
+            "app.services.company_memory", fromlist=["record_company_event"]
+        ).record_company_event(
+            conn,
+            workspace_id=workspace_id,
+            event_type="knowledge",
+            source_id=source_id,
+            title=title.strip(),
+            content=content.strip(),
+            occurred_at=created_at,
+            importance=3.0,
+            metadata={
+                "category": normalized_category,
+                "source_id": source_id,
+                "origin": origin,
+                "source_ref": source_ref,
+                "source_hash": source_hash,
+            },
+        ),
+    )
+    return row
+
+
+def sync_obsidian_documents(
+    conn: Database,
+    *,
+    workspace_id: str,
+    created_by: str,
+    documents: list[dict],
+) -> dict:
+    """Upsert only the desktop's explicitly managed Obsidian Markdown area."""
+    created = 0
+    updated = 0
+    unchanged = 0
+    for document in documents:
+        relative_path = str(document.get("relative_path") or "").strip().replace("\\", "/")
+        if not relative_path or relative_path.startswith("/") or ".." in relative_path.split("/"):
+            raise ValueError("Obsidian 文档路径必须是 managed 区域内的相对路径")
+        content = str(document.get("content") or "").strip()
+        title = str(document.get("title") or relative_path.rsplit("/", 1)[-1]).strip()
+        if not content or not title:
+            continue
+        source_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
+        existing = conn.execute(
+            "SELECT * FROM knowledge_sources WHERE workspace_id = ? "
+            "AND origin = 'obsidian' AND source_ref = ?",
+            (workspace_id, relative_path),
+        ).fetchone()
+        timestamp = now_iso()
+        if existing is None:
+            create_knowledge_source(
+                conn,
+                workspace_id=workspace_id,
+                title=title,
+                category="Obsidian 资料",
+                content=content,
+                created_by=created_by,
+                origin="obsidian",
+                source_ref=relative_path,
+                source_hash=source_hash,
+            )
+            created += 1
+        elif existing.get("source_hash") == source_hash:
+            unchanged += 1
+        else:
+            conn.execute(
+                "UPDATE knowledge_sources SET title = ?, content = ?, source_hash = ?, "
+                "updated_at = ? WHERE id = ? AND workspace_id = ?",
+                (title, content, source_hash, timestamp, existing["id"], workspace_id),
+            )
+            from app.services.company_memory import record_company_event
+
+            record_company_event(
+                conn,
+                workspace_id=workspace_id,
+                event_type="knowledge_update",
+                source_id=f"{existing['id']}:{source_hash}",
+                title=title,
+                content=content,
+                occurred_at=timestamp,
+                importance=3.0,
+                metadata={
+                    "source_id": existing["id"],
+                    "origin": "obsidian",
+                    "source_ref": relative_path,
+                },
+            )
+            updated += 1
+    return {"created": created, "updated": updated, "unchanged": unchanged}
 
 
 def load_knowledge_context(

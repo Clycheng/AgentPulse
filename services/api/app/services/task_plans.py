@@ -312,6 +312,17 @@ def get_task_plan(conn: Database, plan_id: str, *, workspace_id: str) -> dict:
             ORDER BY created_at DESC LIMIT 1""",
             (task["id"],),
         ).fetchone()
+        serialized_runs = []
+        for run in runs:
+            run_payload = dict(run)
+            from app.services.company_memory import get_run_context_summary
+
+            run_payload.update(
+                get_run_context_summary(
+                    conn, workspace_id=workspace_id, run_id=run["id"]
+                )
+            )
+            serialized_runs.append(run_payload)
         task_payloads.append(
             {
                 "id": task["id"],
@@ -327,7 +338,7 @@ def get_task_plan(conn: Database, plan_id: str, *, workspace_id: str) -> dict:
                 "blocked_reason": blocked_event["content"] if blocked_event else "",
                 "outputs": [_serialize_output(row) for row in outputs],
                 "approvals": [serialize_approval(row) for row in approvals],
-                "runs": [dict(row) for row in runs],
+                "runs": serialized_runs,
                 "business_actions": list_actions(
                     conn, workspace_id=plan["workspace_id"], task_id=task["id"]
                 ),
@@ -365,25 +376,33 @@ def list_task_runs(conn: Database, *, workspace_id: str, task_id: str) -> list[d
         "SELECT * FROM runs WHERE task_id = ? ORDER BY attempt_no, created_at",
         (task_id,),
     ).fetchall()
-    return [
-        {
-            "id": row["id"],
-            "task_id": row["task_id"],
-            "status": row["status"],
-            "attempt_no": row["attempt_no"],
-            "error": row["error"] or "",
-            "lease_owner": row["lease_owner"],
-            "lease_expires_at": row["lease_expires_at"],
-            "started_at": row["started_at"],
-            "created_at": row["created_at"],
-            "completed_at": row["completed_at"],
-            "steps": list_run_steps(conn, row["id"]),
-            "business_actions": list_actions(
-                conn, workspace_id=workspace_id, run_id=row["id"]
-            ),
-        }
-        for row in runs
-    ]
+    result = []
+    from app.services.company_memory import get_run_context_summary
+
+    for row in runs:
+        context = get_run_context_summary(
+            conn, workspace_id=workspace_id, run_id=row["id"]
+        )
+        result.append(
+            {
+                "id": row["id"],
+                "task_id": row["task_id"],
+                "status": row["status"],
+                "attempt_no": row["attempt_no"],
+                "error": row["error"] or "",
+                "lease_owner": row["lease_owner"],
+                "lease_expires_at": row["lease_expires_at"],
+                "started_at": row["started_at"],
+                "created_at": row["created_at"],
+                "completed_at": row["completed_at"],
+                "steps": list_run_steps(conn, row["id"]),
+                "business_actions": list_actions(
+                    conn, workspace_id=workspace_id, run_id=row["id"]
+                ),
+                **context,
+            }
+        )
+    return result
 
 
 def resume_task(

@@ -47,3 +47,4 @@
 - [0010](0010-durable-task-dispatch-and-company-tools.md) — 数据库持久任务调度 + 每 Run 动态 Hermes MCP 公司工具：一次确认后自动接力、重启恢复，Hermes 不直写业务库
 - [0011](0011-controlled-business-actions.md) — 受控业务动作：业务密钥由 AgentPulse 托管，独立动态 MCP + 持久动作队列在审批后执行真实外部调用
 - [0012](0012-cloud-hosted-desktop-distribution.md) — 云端托管薄桌面客户端 + workspace BYOK + 零固定成本安装包分发
+- [0013](0013-company-world-model-and-cognitive-memory.md) — 公司事件账本 + 独立员工记忆 + 每 Run 上下文检索

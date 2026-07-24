@@ -13,6 +13,7 @@ from app.api.routes.channels import router as channels_router
 from app.api.routes.health import router as health_router
 from app.api.routes.ideas import router as ideas_router
 from app.api.routes.model_settings import router as model_settings_router
+from app.api.routes.memory import router as memory_router
 from app.api.routes.runs import router as runs_router
 from app.api.routes.team_compiler import router as team_compiler_router
 from app.api.routes.task_plans import router as task_plans_router
@@ -109,6 +110,7 @@ def create_app() -> FastAPI:
     app.include_router(runs_router, prefix="/api")
     app.include_router(ideas_router, prefix="/api")
     app.include_router(model_settings_router, prefix="/api")
+    app.include_router(memory_router, prefix="/api")
     app.include_router(channels_router, prefix="/api")
     app.include_router(catalog_router, prefix="/api")
     app.include_router(team_compiler_router, prefix="/api")
@@ -168,6 +170,7 @@ async def _idle_cron_loop() -> None:
     from app.runtime.idle_think import run_idle_tick
     from app.runtime.profile_provisioner import build_provisioner_from_settings
     from app.runtime.reflection import run_reflection_tick
+    from app.services.company_memory import run_memory_reflection_tick
 
     while True:
         await asyncio.sleep(settings.idle_cron_interval_seconds)
@@ -184,10 +187,13 @@ async def _idle_cron_loop() -> None:
                     provisioner=build_provisioner_from_settings(),
                     hermes_work_root=settings.hermes_work_root,
                 )
+                memory_reflections = run_memory_reflection_tick(conn)
+                conn.commit()
                 logger.info(
                     "cron_tick",
                     ideas=idle_result["ideas_created"],
                     skills=reflection_result["skills_learned"],
+                    memory_reflections=memory_reflections,
                 )
             finally:
                 conn.close()

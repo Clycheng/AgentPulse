@@ -21,6 +21,18 @@ declare global {
         set: (value: { accessToken: string; user: User }) => Promise<boolean>;
         clear: () => Promise<boolean>;
       };
+      obsidian: {
+        pickManaged: () => Promise<{
+          vault_name: string;
+          managed_area: string;
+          documents: Array<{
+            relative_path: string;
+            title: string;
+            content: string;
+            modified_at: string;
+          }>;
+        } | null>;
+      };
     };
   }
 }
@@ -300,6 +312,26 @@ type AgentExperience = {
   time: string;
 };
 
+type AgentMemory = {
+  id: string;
+  memory_type: 'observation' | 'episode' | 'reflection' | 'relationship' | 'lesson' | string;
+  title: string;
+  content: string;
+  importance: number;
+  confidence: number;
+  is_private: number;
+  promoted: number;
+  evidence_event_ids: string[];
+  created_at: string;
+};
+
+type CompanyEventAudit = {
+  id: string;
+  title: string;
+  actor_name: string;
+  occurred_at: string;
+};
+
 type KnowledgeSource = {
   id: string;
   title: string;
@@ -308,6 +340,15 @@ type KnowledgeSource = {
   createdBy: string;
   createdAt: string;
   updatedAt: string;
+  origin?: string;
+  sourceRef?: string;
+};
+
+type ManagedObsidianDocument = {
+  relative_path: string;
+  title: string;
+  content: string;
+  modified_at: string;
 };
 
 type HireTemplate = {
@@ -404,6 +445,8 @@ type ApiBootstrap = {
     created_by: string;
     created_at: string;
     updated_at: string;
+    origin?: string;
+    source_ref?: string;
   }>;
   task_events_by_task: Record<
     string,
@@ -931,6 +974,8 @@ function mapBootstrap(data: ApiBootstrap) {
       createdBy: source.created_by,
       createdAt: formatTime(source.created_at),
       updatedAt: formatTime(source.updated_at),
+      origin: source.origin,
+      sourceRef: source.source_ref,
     }),
   );
 
@@ -1020,6 +1065,7 @@ function App() {
   const [knowledgeTitle, setKnowledgeTitle] = useState('');
   const [knowledgeCategory, setKnowledgeCategory] = useState('品牌资料');
   const [knowledgeContent, setKnowledgeContent] = useState('');
+  const [obsidianSyncing, setObsidianSyncing] = useState(false);
   const [onboardingOpen, setOnboardingOpen] = useState(false);
   const [onboardingStep, setOnboardingStep] = useState(0);
   const [modelProvider, setModelProvider] =
@@ -2037,6 +2083,38 @@ function App() {
     }
   };
 
+  const syncObsidian = async () => {
+    if (!token || !window.agentpulse?.obsidian) {
+      showToast('当前运行环境不支持 Obsidian 同步');
+      return;
+    }
+    setObsidianSyncing(true);
+    try {
+      const selection = await window.agentpulse.obsidian.pickManaged();
+      if (!selection) return;
+      if (!selection.documents.length) {
+        showToast('未找到 .agentpulse/managed 下的 Markdown 资料');
+        return;
+      }
+      const result = await apiRequest<{ created: number; updated: number; unchanged: number }>(
+        '/knowledge-sources/obsidian-sync',
+        {
+          method: 'POST',
+          token,
+          body: JSON.stringify({ documents: selection.documents }),
+        },
+      );
+      await loadBootstrap(token);
+      showToast(
+        `Obsidian 已同步：新增 ${result.created}，更新 ${result.updated}，未变 ${result.unchanged}`,
+      );
+    } catch (error) {
+      showToast(error instanceof Error ? error.message : 'Obsidian 同步失败');
+    } finally {
+      setObsidianSyncing(false);
+    }
+  };
+
   const resolveApproval = async (
     approval: Approval,
     status: 'approved' | 'rejected',
@@ -2353,6 +2431,8 @@ function App() {
             skills={allSkills}
             mcps={allMcps}
             onOpenKnowledge={() => setKnowledgeOpen(true)}
+            onSyncObsidian={syncObsidian}
+            obsidianSyncing={obsidianSyncing}
           />
         )}
 
@@ -4970,6 +5050,8 @@ function LibraryView({
   skills,
   mcps,
   onOpenKnowledge,
+  onSyncObsidian,
+  obsidianSyncing,
 }: {
   tabs: Array<{ key: LibraryTab; label: string }>;
   activeTab: LibraryTab;
@@ -4978,6 +5060,8 @@ function LibraryView({
   skills: string[];
   mcps: string[];
   onOpenKnowledge: () => void;
+  onSyncObsidian: () => void;
+  obsidianSyncing: boolean;
 }) {
   const { t } = useTranslation();
   const categoryCount = new Set(knowledgeSources.map((source) => source.category))
@@ -4992,9 +5076,14 @@ function LibraryView({
             <p>{t('library.subtitle')}</p>
           </div>
           {activeTab === 'docs' && (
-            <button className="button primary" type="button" onClick={onOpenKnowledge}>
-              {materialIcon('note_add')}{t('library.addSource')}
-            </button>
+            <div className="page-header-actions">
+              <button className="button secondary" type="button" onClick={onSyncObsidian} disabled={obsidianSyncing}>
+                {materialIcon('sync')}{obsidianSyncing ? t('library.syncingObsidian') : t('library.syncObsidian')}
+              </button>
+              <button className="button primary" type="button" onClick={onOpenKnowledge}>
+                {materialIcon('note_add')}{t('library.addSource')}
+              </button>
+            </div>
           )}
         </header>
 
@@ -5045,6 +5134,9 @@ function LibraryView({
                     <span>{source.category}</span>
                     <strong>{source.title}</strong>
                     <p>{excerpt(source.content, 130)}</p>
+                    {source.origin === 'obsidian' && source.sourceRef && (
+                      <em>{materialIcon('folder_open')}{source.sourceRef}</em>
+                    )}
                     <em>
                       {materialIcon('schedule')}
                       {t('library.updatedAt', { date: source.updatedAt })}
@@ -5138,6 +5230,11 @@ function AgentDetail({
   const [credentialBusy, setCredentialBusy] = useState('');
   const [credentialMsg, setCredentialMsg] = useState('');
   const [businessActions, setBusinessActions] = useState<BusinessAction[]>([]);
+  const [memories, setMemories] = useState<AgentMemory[]>([]);
+  const [companyEvents, setCompanyEvents] = useState<CompanyEventAudit[]>([]);
+  const [relationships, setRelationships] = useState<
+    Array<{ colleague_name: string; colleague_role: string; summary: string; trust_score: number }>
+  >([]);
   const [businessPolicies, setBusinessPolicies] = useState<
     Array<{ id: string; tool_name: string; created_at: string }>
   >([]);
@@ -5180,6 +5277,15 @@ function AgentDetail({
     )
       .then(setBusinessPolicies)
       .catch(() => setBusinessPolicies([]));
+    apiRequest<AgentMemory[]>(`/agents/${agent.id}/memory?limit=12`, { token })
+      .then(setMemories)
+      .catch(() => setMemories([]));
+    apiRequest<typeof relationships>(`/agents/${agent.id}/relationships`, { token })
+      .then(setRelationships)
+      .catch(() => setRelationships([]));
+    apiRequest<CompanyEventAudit[]>('/company-events?limit=200', { token })
+      .then(setCompanyEvents)
+      .catch(() => setCompanyEvents([]));
   };
 
   useEffect(() => {
@@ -5581,6 +5687,46 @@ function AgentDetail({
                 </div>
                 <p>{experience.summary}</p>
                 {experience.lessons && <em>{experience.lessons}</em>}
+              </article>
+            ))}
+          </section>
+
+          <section className="drawer-section">
+            <div className="growth-head">
+              <h3>认知记忆与证据</h3>
+              <span className="drawer-section-note">原始公司记录可回溯</span>
+            </div>
+            {relationships.length > 0 && (
+              <div className="business-policy-list">
+                {relationships.slice(0, 4).map((relationship) => (
+                  <div key={`${relationship.colleague_name}-${relationship.summary}`}>
+                    <span>
+                      {materialIcon('groups')}
+                      <strong>{relationship.colleague_name}</strong>
+                      <em>{relationship.summary}</em>
+                    </span>
+                    <small>{Math.round(relationship.trust_score * 100)}%</small>
+                  </div>
+                ))}
+              </div>
+            )}
+            {memories.length === 0 && <EmptyState>暂无可审计记忆</EmptyState>}
+            {memories.slice(0, 8).map((memory) => (
+              <article className="experience-card" key={memory.id}>
+                <div>
+                  {materialIcon(memory.memory_type === 'reflection' ? 'psychology' : 'fact_check')}
+                  <strong>{memory.title || memory.memory_type}</strong>
+                  <span>{memory.is_private ? '员工私有判断' : '公司共享经验'}</span>
+                </div>
+                <p>{memory.content}</p>
+                <em>
+                  证据 {memory.evidence_event_ids.length} 条
+                  {memory.evidence_event_ids.slice(0, 2).map((eventId) => {
+                    const event = companyEvents.find((item) => item.id === eventId);
+                    return event ? ` · ${event.actor_name}：${event.title}` : '';
+                  }).join('')}
+                  {' · '}可信度 {Math.round(memory.confidence * 100)}%
+                </em>
               </article>
             ))}
           </section>

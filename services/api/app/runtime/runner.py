@@ -202,6 +202,14 @@ async def stream_agent_run(
             status=RunStatus.QUEUED,
         )
     ctx.run_id = run_id
+    if ctx.context_manifest_id:
+        from app.services.company_memory import attach_manifest_to_run
+
+        attach_manifest_to_run(conn, ctx.context_manifest_id, run_id)
+        conn.execute(
+            "UPDATE runs SET context_manifest_id = ? WHERE id = ?",
+            (ctx.context_manifest_id, run_id),
+        )
     if ctx.workspace_id:
         from app.services.model_credentials import runtime_model_environment
 
@@ -343,6 +351,24 @@ async def stream_agent_run(
         conn, run_id, final_status, error=error,
         output_message_id=(message_row["id"] if message_row else None),
     )
+    if ctx.workspace_id and ctx.agent_id and text:
+        try:
+            from app.services.company_memory import record_run_observation
+
+            record_run_observation(
+                conn,
+                workspace_id=ctx.workspace_id,
+                agent_id=ctx.agent_id,
+                run_id=run_id,
+                conversation_id=ctx.conversation_id or None,
+                task_id=ctx.task_id or None,
+                reply=text,
+                status=final_status,
+            )
+        except Exception:
+            # The run result remains authoritative even if a derived memory
+            # projection cannot be written on a legacy test database.
+            pass
     if final_status == RunStatus.COMPLETED and ctx.agent_id:
         # TD-06-T1: count completed runs toward skill reflection (a background
         # tick runs the actual, expensive reflection off the hot path).

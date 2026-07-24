@@ -46,6 +46,7 @@ async def run_function_loop(
     related_tasks: list | None = None,
     knowledge_sources: list | None = None,
     agent_experiences: list | None = None,
+    cognitive_context: str = "",
 ) -> AsyncGenerator[dict, None]:
     """Run the function-calling loop, yielding {type: chunk|tool_call|tool_result} events.
 
@@ -69,6 +70,7 @@ async def run_function_loop(
             related_tasks=related_tasks,
             knowledge_sources=knowledge_sources,
             agent_experiences=agent_experiences,
+            cognitive_context=cognitive_context,
         ),
     })
 
