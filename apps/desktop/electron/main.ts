@@ -174,7 +174,9 @@ function writeLocalWorkerState(value: LocalWorkerState) {
 }
 
 function localApiBaseUrl() {
-  return process.env.VITE_AGENTPULSE_API_URL ?? 'http://127.0.0.1:8000/api';
+  return isDev
+    ? (process.env.VITE_AGENTPULSE_API_URL ?? 'http://127.0.0.1:8000/api')
+    : 'https://api.agentpulse.cc/api';
 }
 
 async function localApiRequest<T>(
