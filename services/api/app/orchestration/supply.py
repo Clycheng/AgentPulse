@@ -72,10 +72,12 @@ def create_agent_spec(
     Returns:
         Serialized spec dict
     """
+    cap_keys = list(dict.fromkeys(capability_keys or []))
+    validate_capability_keys(cap_keys)
+
     spec_id = _new_id("spec")
     now = _now_iso()
     resp_json = json.dumps(responsibilities or [], ensure_ascii=False)
-    cap_keys = capability_keys or []
 
     # Create spec row
     conn.execute(
@@ -87,8 +89,45 @@ def create_agent_spec(
         (spec_id, agent_id, workspace_id, role_name, source_request, resp_json, now, now),
     )
 
-    # Create capability rows from catalog
+    ensure_agent_capability_rows(
+        conn,
+        agent_id=agent_id,
+        workspace_id=workspace_id,
+        capability_keys=cap_keys,
+        created_at=now,
+    )
+
+    return _serialize_spec(conn, spec_id)
+
+
+def ensure_agent_capability_rows(
+    conn: Database,
+    *,
+    agent_id: str,
+    workspace_id: str,
+    capability_keys: list[str],
+    created_at: str | None = None,
+) -> None:
+    """Add catalog capability rows without duplicating an existing spec.
+
+    Bootstrap paths can run more than once (for example when an old workspace
+    is opened after a catalog upgrade). Keeping this operation idempotent means
+    the secretary can be backfilled without creating a second spec or resetting
+    capabilities the owner has already disabled.
+    """
+    cap_keys = list(dict.fromkeys(capability_keys))
+    validate_capability_keys(cap_keys)
+    now = created_at or _now_iso()
+    existing = {
+        row["capability_key"]
+        for row in conn.execute(
+            "SELECT capability_key FROM agent_capabilities WHERE agent_id = ?",
+            (agent_id,),
+        ).fetchall()
+    }
     for key in cap_keys:
+        if key in existing:
+            continue
         cap_def = get_capability(key)
         cap_id = _new_id("cap")
         conn.execute(
@@ -113,8 +152,6 @@ def create_agent_spec(
                 now,
             ),
         )
-
-    return _serialize_spec(conn, spec_id)
 
 
 def provision(

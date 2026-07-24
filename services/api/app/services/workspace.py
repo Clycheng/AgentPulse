@@ -225,40 +225,96 @@ def create_workspace_for_user(
     return get_workspace_by_id(conn, workspace_id)
 
 
-# Default capabilities every new secretary gets — deliberately restricted to
-# risk_gate='auto' entries with zero required_credentials (see
-# capability_catalog.CATALOG). provision() is all-or-nothing: a single
-# credential-missing capability blocks the whole spec at
-# 'blocked_on_credentials' with no real Hermes profile at all (see ADR 0008 /
-# supply.provision docstring), so anything needing a token the owner hasn't
-# configured would leave the secretary worse off than having no spec at all.
-SECRETARY_DEFAULT_CAPABILITIES = [
-    "task_delegation",
-    "data_analysis",
-    "report_generation",
-]
+# The secretary is the company's generalist entry point. Every catalog entry
+# is granted at bootstrap; credentials and risk gates still decide whether a
+# capability is executable right now.
+SECRETARY_DEFAULT_CAPABILITIES = list(CATALOG)
 
 
 def _bootstrap_secretary_capabilities(
     conn: Database, secretary_id: str, workspace_id: str
 ) -> None:
-    """Give the default secretary a real, ready Hermes profile on day one.
+    """Ensure the built-in secretary has the complete capability catalogue.
 
-    Thin wrapper around the shared provision_new_agent — see its docstring
-    for the settings.hermes_provisioning gate and the credential-split
-    behavior (moot here since every default capability is credential-free,
-    but going through the one shared function keeps this consistent with
-    every other hiring path instead of re-deriving the same dance).
+    This is idempotent because it also repairs workspaces created before the
+    full default grant was introduced. In local/fallback mode we materialize
+    capability rows even without a Hermes profile, so the UI and function loop
+    do not incorrectly make the secretary look unconfigured. Credential-backed
+    capabilities remain ``credential_missing`` and approval/prohibited gates
+    are never relaxed here.
     """
-    provision_new_agent(
+    from app.core.config import settings
+    from app.orchestration.supply import create_agent_spec, ensure_agent_capability_rows
+
+    spec = conn.execute(
+        "SELECT * FROM agent_specs WHERE agent_id = ?", (secretary_id,)
+    ).fetchone()
+    if spec is None:
+        if settings.hermes_provisioning:
+            provision_new_agent(
+                conn,
+                agent_id=secretary_id,
+                workspace_id=workspace_id,
+                role_name="老板秘书",
+                source_request="系统默认配置：秘书上岗即具备全部公司能力",
+                responsibilities=[],
+                capability_keys=SECRETARY_DEFAULT_CAPABILITIES,
+            )
+            return
+        create_agent_spec(
+            conn,
+            agent_id=secretary_id,
+            workspace_id=workspace_id,
+            role_name="老板秘书",
+            source_request="系统默认配置：秘书上岗即具备全部公司能力",
+            responsibilities=[],
+            capability_keys=SECRETARY_DEFAULT_CAPABILITIES,
+        )
+
+    ensure_agent_capability_rows(
         conn,
         agent_id=secretary_id,
         workspace_id=workspace_id,
-        role_name="老板秘书",
-        source_request="系统默认配置：秘书上岗即具备基础助理能力",
-        responsibilities=[],
         capability_keys=SECRETARY_DEFAULT_CAPABILITIES,
     )
+
+    # No Hermes profile is needed for local DeepSeek/function-loop mode, but
+    # capability state must still be honest and useful to the UI.
+    if not settings.hermes_provisioning:
+        now = now_iso()
+        configured_credentials = {
+            row["credential_name"]
+            for row in conn.execute(
+                "SELECT credential_name FROM agent_credentials WHERE agent_id = ?",
+                (secretary_id,),
+            ).fetchall()
+        }
+        rows = conn.execute(
+            "SELECT id, capability_key, status FROM agent_capabilities WHERE agent_id = ?",
+            (secretary_id,),
+        ).fetchall()
+        credential_missing = False
+        for row in rows:
+            cap_def = CATALOG[row["capability_key"]]
+            target_status = (
+                "enabled"
+                if set(cap_def.required_credentials).issubset(configured_credentials)
+                else "credential_missing"
+            )
+            credential_missing = credential_missing or target_status == "credential_missing"
+            if row["status"] != "disabled" and row["status"] != target_status:
+                conn.execute(
+                    "UPDATE agent_capabilities SET status = ?, updated_at = ? WHERE id = ?",
+                    (target_status, now, row["id"]),
+                )
+        target_spec_status = "blocked_on_credentials" if credential_missing else "draft"
+        conn.execute(
+            """UPDATE agent_specs
+                  SET status = ?, updated_at = ?
+                WHERE agent_id = ? AND hermes_profile IS NULL
+                  AND status NOT IN ('provisioning', 'ready')""",
+            (target_spec_status, now, secretary_id),
+        )
 
 
 def create_agent(
@@ -1432,6 +1488,14 @@ def get_bootstrap(conn: Database, workspace_id: str) -> dict:
         (workspace_id,),
     ).fetchall()
     departments_by_id = {department["id"]: department for department in departments}
+    secretary = conn.execute(
+        """SELECT id FROM agents
+           WHERE workspace_id = ? AND source = 'system_secretary'
+           ORDER BY created_at LIMIT 1""",
+        (workspace_id,),
+    ).fetchone()
+    if secretary is not None:
+        _bootstrap_secretary_capabilities(conn, secretary["id"], workspace_id)
     agents = conn.execute(
         "SELECT * FROM agents WHERE workspace_id = ? ORDER BY created_at", (workspace_id,)
     ).fetchall()

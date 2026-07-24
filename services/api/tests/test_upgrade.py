@@ -188,9 +188,9 @@ def test_resolve_capability_upgrade_installs_without_api_run_transition(tmp_path
 
     conn = connect()
     conn.execute(
-        "INSERT INTO agent_specs (id, agent_id, workspace_id, role_name, hermes_profile, "
-        "status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, 'ready', ?, ?)",
-        (new_id("spec"), agent_id, ws_id, "前端", "p_boot", now_iso(), now_iso()),
+        "UPDATE agent_specs SET role_name = ?, hermes_profile = ?, status = 'ready', "
+        "updated_at = ? WHERE agent_id = ? AND workspace_id = ?",
+        ("前端", "p_boot", now_iso(), agent_id, ws_id),
     )
     conv_id = new_id("conv")
     conn.execute(
@@ -223,7 +223,8 @@ def test_resolve_capability_upgrade_installs_without_api_run_transition(tmp_path
     assert resp.json()["status"] == "approved"
     conn2 = connect()
     cap = conn2.execute(
-        "SELECT capability_key, status FROM agent_capabilities WHERE agent_id = ?",
+        "SELECT capability_key, status FROM agent_capabilities "
+        "WHERE agent_id = ? AND capability_key = 'write_code'",
         (agent_id,),
     ).fetchone()
     assert cap["capability_key"] == "write_code"  # installed via the suggested key
@@ -270,9 +271,9 @@ def test_grant_capability_endpoint_no_pending_approval_needed(tmp_path, monkeypa
     )
     conn = connect()
     conn.execute(
-        "INSERT INTO agent_specs (id, agent_id, workspace_id, role_name, hermes_profile, "
-        "status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, 'ready', ?, ?)",
-        (new_id("spec"), agent_id, ws_id, "前端", "p_grant", now_iso(), now_iso()),
+        "UPDATE agent_specs SET role_name = ?, hermes_profile = ?, status = 'ready', "
+        "updated_at = ? WHERE agent_id = ? AND workspace_id = ?",
+        ("前端", "p_grant", now_iso(), agent_id, ws_id),
     )
     conn.commit()
 
@@ -286,7 +287,8 @@ def test_grant_capability_endpoint_no_pending_approval_needed(tmp_path, monkeypa
 
     conn2 = connect()
     cap = conn2.execute(
-        "SELECT capability_key, status FROM agent_capabilities WHERE agent_id = ?",
+        "SELECT capability_key, status FROM agent_capabilities "
+        "WHERE agent_id = ? AND capability_key = 'write_code'",
         (agent_id,),
     ).fetchone()
     assert cap["capability_key"] == "write_code"
@@ -307,9 +309,9 @@ def test_grant_capability_endpoint_unknown_key_400s(tmp_path, monkeypatch):
     )
     conn = connect()
     conn.execute(
-        "INSERT INTO agent_specs (id, agent_id, workspace_id, role_name, hermes_profile, "
-        "status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, 'ready', ?, ?)",
-        (new_id("spec"), agent_id, ws_id, "前端", "p_grant_bad", now_iso(), now_iso()),
+        "UPDATE agent_specs SET role_name = ?, hermes_profile = ?, status = 'ready', "
+        "updated_at = ? WHERE agent_id = ? AND workspace_id = ?",
+        ("前端", "p_grant_bad", now_iso(), agent_id, ws_id),
     )
     conn.commit()
 

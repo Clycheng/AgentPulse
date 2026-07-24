@@ -208,10 +208,11 @@ def test_idle_thinking_update(tmp_path, monkeypatch):
 def test_idle_thinking_without_spec_returns_404(tmp_path, monkeypatch):
     client = make_client(tmp_path, monkeypatch)
     token, secretary_id = register(client)
-    # The default secretary has no agent_specs row.
+    # The default secretary has a full capability spec even in fallback mode.
     resp = client.patch(
         f"/api/agents/{secretary_id}/idle-thinking",
         headers=auth_header(token),
         json={"enabled": False},
     )
-    assert resp.status_code == 404
+    assert resp.status_code == 200
+    assert resp.json()["idle_thinking_enabled"] is False

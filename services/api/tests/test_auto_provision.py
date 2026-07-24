@@ -103,6 +103,7 @@ def test_secretary_gets_default_capabilities_when_provisioning_enabled(tmp_path,
         new_id,
         now_iso,
     )
+    from app.orchestration.capability_catalog import CATALOG
 
     monkeypatch.setattr(
         settings, "database_url", f"sqlite:///{tmp_path / 'secretary_on.sqlite3'}"
@@ -140,21 +141,30 @@ def test_secretary_gets_default_capabilities_when_provisioning_enabled(tmp_path,
     assert spec["status"] == "ready" and spec["hermes_profile"]
 
     caps = {
-        row["capability_key"]
+        row["capability_key"]: row["status"]
         for row in conn.execute(
-            "SELECT capability_key FROM agent_capabilities WHERE agent_id = ? AND status = 'enabled'",
+            "SELECT capability_key, status FROM agent_capabilities WHERE agent_id = ?",
             (secretary["id"],),
         ).fetchall()
     }
-    assert caps == set(SECRETARY_DEFAULT_CAPABILITIES)
+    assert set(caps) == set(SECRETARY_DEFAULT_CAPABILITIES) == set(CATALOG)
+    assert {
+        key for key, status in caps.items() if status == "enabled"
+    } == {key for key, cap in CATALOG.items() if not cap.required_credentials}
+    assert {
+        key for key, status in caps.items() if status == "credential_missing"
+    } == {key for key, cap in CATALOG.items() if cap.required_credentials}
 
 
-def test_secretary_has_no_spec_when_provisioning_disabled(tmp_path, monkeypatch):
-    """Default (no Hermes configured): the secretary stays exactly as before —
-    no spec row at all — so the whole test suite's DeepSeek-fallback
-    assumptions for the bootstrap secretary aren't disturbed."""
+def test_secretary_has_full_capability_spec_when_provisioning_disabled(tmp_path, monkeypatch):
+    """Fallback mode still exposes the full authorization state to the UI."""
     from app.core.database import connect, init_db
-    from app.services.workspace import create_workspace_for_user, new_id, now_iso
+    from app.services.workspace import (
+        SECRETARY_DEFAULT_CAPABILITIES,
+        create_workspace_for_user,
+        new_id,
+        now_iso,
+    )
 
     monkeypatch.setattr(
         settings, "database_url", f"sqlite:///{tmp_path / 'secretary_off.sqlite3'}"
@@ -175,9 +185,61 @@ def test_secretary_has_no_spec_when_provisioning_disabled(tmp_path, monkeypatch)
         "SELECT id FROM agents WHERE workspace_id = ? AND name = '小秘'", (ws["id"],)
     ).fetchone()
     spec = conn.execute(
-        "SELECT id FROM agent_specs WHERE agent_id = ?", (secretary["id"],)
+        "SELECT status, hermes_profile FROM agent_specs WHERE agent_id = ?", (secretary["id"],)
     ).fetchone()
-    assert spec is None
+    assert spec["status"] == "blocked_on_credentials"
+    assert spec["hermes_profile"] is None
+    cap_count = conn.execute(
+        "SELECT COUNT(*) AS c FROM agent_capabilities WHERE agent_id = ?",
+        (secretary["id"],),
+    ).fetchone()["c"]
+    assert cap_count == len(SECRETARY_DEFAULT_CAPABILITIES)
+
+
+def test_secretary_backfills_missing_capabilities_on_bootstrap(tmp_path, monkeypatch):
+    from app.core.database import connect, init_db
+    from app.services.workspace import (
+        SECRETARY_DEFAULT_CAPABILITIES,
+        create_workspace_for_user,
+        get_bootstrap,
+        new_id,
+        now_iso,
+    )
+
+    monkeypatch.setattr(
+        settings, "database_url", f"sqlite:///{tmp_path / 'secretary_backfill.sqlite3'}"
+    )
+    monkeypatch.setattr(settings, "hermes_provisioning", False)
+    init_db()
+    conn = connect()
+    user_id = new_id("user")
+    conn.execute(
+        "INSERT INTO users (id, email, password_hash, display_name, created_at) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (user_id, "boss4b@ex.com", "x", "老板", now_iso()),
+    )
+    ws = create_workspace_for_user(conn, user_id, "公司4b")
+    secretary = conn.execute(
+        "SELECT id FROM agents WHERE workspace_id = ? AND name = '小秘'", (ws["id"],)
+    ).fetchone()
+    conn.execute(
+        "DELETE FROM agent_capabilities WHERE agent_id = ? AND capability_key = 'computer_use'",
+        (secretary["id"],),
+    )
+    conn.commit()
+
+    get_bootstrap(conn, ws["id"])
+    keys = {
+        row["capability_key"]
+        for row in conn.execute(
+            "SELECT capability_key FROM agent_capabilities WHERE agent_id = ?",
+            (secretary["id"],),
+        ).fetchall()
+    }
+    assert keys == set(SECRETARY_DEFAULT_CAPABILITIES)
+    assert conn.execute(
+        "SELECT COUNT(*) AS c FROM agent_specs WHERE agent_id = ?", (secretary["id"],)
+    ).fetchone()["c"] == 1
 
 
 # ------------------------------------------- Talent Market hire provisioning

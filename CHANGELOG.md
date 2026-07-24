@@ -5,6 +5,12 @@
 
 ## [Unreleased]
 
+### 2026-07-24（默认秘书全能力授权修复）
+
+- **fix(capabilities)**：新注册工作区的小秘现在默认拥有能力目录中的全部 41 项能力；无需凭证的能力直接启用，需要外部凭证的能力明确显示为待配置，审批和禁止自动执行的风险门保持不变。
+- **fix(bootstrap)**：本地 DeepSeek/function-loop 模式也会创建完整 `agent_specs`/`agent_capabilities`，旧工作区首次加载时幂等补齐，不重复创建规格、不覆盖已禁用能力；凭证录入后的能力状态不会被后续刷新错误重置。
+- **test**：新增全量授权、凭证状态和旧工作区补齐回归；全套 API **362 passed / 9 skipped**，并完成真实桌面员工档案验证。
+
 ### 2026-07-24（TD-13：公司世界模型与独立员工认知闭环）
 
 - **feat(memory)**：新增 workspace 隔离的 `company_events`、`agent_memories`、`memory_links`、`agent_relationships` 和 `context_manifests`。聊天/私聊、任务事件、产出、知识资料和员工经验在原写入事务中进入不可变公司事件账本；原文保留，旧 transcript 超过预算时生成带证据链接的 episode。

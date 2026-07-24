@@ -754,15 +754,13 @@ def _give_agent_ready_hermes_profile(agent_id: str, workspace_id: str) -> None:
     conn = connect()
     try:
         conn.execute(
-            """
-            INSERT INTO agent_specs (
-              id, agent_id, workspace_id, role_name, source_request,
-              responsibilities_json, hermes_profile, status, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, 'ready', ?, ?)
-            """,
+            """UPDATE agent_specs
+               SET role_name = ?, source_request = ?, responsibilities_json = ?,
+                   hermes_profile = ?, status = 'ready', updated_at = ?
+             WHERE agent_id = ? AND workspace_id = ?""",
             (
-                new_id("spec"), agent_id, workspace_id, "测试角色",
-                "test", "[]", "ap_test_profile", now_iso(), now_iso(),
+                "测试角色", "test", "[]", "ap_test_profile", now_iso(),
+                agent_id, workspace_id,
             ),
         )
         conn.commit()

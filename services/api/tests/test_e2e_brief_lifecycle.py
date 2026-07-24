@@ -54,7 +54,14 @@ def setup(tmp_path, monkeypatch):
             """INSERT INTO agent_specs (
               id, agent_id, workspace_id, role_name, source_request,
               responsibilities_json, hermes_profile, status, created_at, updated_at
-            ) VALUES (?, ?, ?, '老板秘书', 'test', '[]', 'test-secretary', 'ready', ?, ?)""",
+            ) VALUES (?, ?, ?, '老板秘书', 'test', '[]', 'test-secretary', 'ready', ?, ?)
+            ON CONFLICT (agent_id) DO UPDATE SET
+              role_name = excluded.role_name,
+              source_request = excluded.source_request,
+              responsibilities_json = excluded.responsibilities_json,
+              hermes_profile = excluded.hermes_profile,
+              status = excluded.status,
+              updated_at = excluded.updated_at""",
             (new_id("spec"), secretary["id"], workspace_id, now_iso(), now_iso()),
         )
         db.commit()
