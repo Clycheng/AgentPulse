@@ -13,7 +13,7 @@
 |---|---|---|---|---|
 | 1 | TD-12 零成本云端部署与桌面分发闭环 | 官网下载 → 注册/BYOK → 云端 Hermes | **是**（真实 Hermes/Docker/桌面/线上） | 🔵 进行中（Codex，2026-07-24；代码/安全/镜像已验，待云资源与线上 E2E） |
 | 2 | TD-13 公司世界模型与独立员工认知闭环 | 公司事件账本 → 记忆检索 → 独立同事协作 → 反思 | **是**（数据库/编排/Hermes/UI/E2E） | 🔵 进行中（Codex，2026-07-24；代码闭环/SQLite/API/UI/Obsidian 已验，真实 Hermes 四人认知 E2E 待执行） |
-| 3 | TD-14R 真实能力执行、本机 Hermes 与 DeerFlow 能力增强 | 先消除虚假执行，再接通桌面端本机 Hermes 和安全 Worker | **是**（API/桌面/Hermes/真机） | 🔵 进行中（Codex，2026-07-25；P0 回执/防假执行、设备/项目 Run API、Electron 只读 Worker 已完成；待 Hermes runtime/profile 打包、审批型本机工具与真机 E2E） |
+| 3 | TD-14R-P1 开箱即用的本机 Hermes 闭环 | 安装包内置 Hermes/Worker，项目读写/命令/电脑控制经真实审批和回执执行 | **是**（API/桌面/Hermes/真机） | 🔵 进行中（Codex，2026-07-25；M0 契约已开始。当前开发版不是开箱即用产品，禁止以系统 PATH Hermes 或 one-shot 路径作为验收） |
 | 4 | TD-09-T3 剩余(渠道出站回复 + 微信/widget 适配器) | 渠道入站已通，出站未接 | 否（微信/widget 需真账号） | ⚪ |
 | 5 | TD-08-T3 **剩余 UI 收尾**(空闲思考开关设置项，可选) | 前端 + IdleThinkService 均已完成✅ | 否（前端）| ⚪ |
 

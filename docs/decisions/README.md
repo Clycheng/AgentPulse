@@ -49,3 +49,4 @@
 - [0012](0012-cloud-hosted-desktop-distribution.md) — 云端托管薄桌面客户端 + workspace BYOK + 零固定成本安装包分发
 - [0013](0013-company-world-model-and-cognitive-memory.md) — 公司事件账本 + 独立员工记忆 + 每 Run 上下文检索
 - [0014](0014-local-hermes-and-runtime-guards.md) — 本机 Hermes 执行、设备/项目绑定与真实性运行时守卫
+- [0015](0015-bundled-local-hermes-runtime.md) — 桌面安装包内置 Hermes runtime、Local Worker 与短期设备运行凭证

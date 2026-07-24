@@ -5,6 +5,11 @@
 
 ## [Unreleased]
 
+### 2026-07-25（TD-14R-P1：开箱即用本机 Hermes 合同开始）
+
+- **architecture**：新增 ADR 0015 与 TD-14R-P1 验收合同。桌面产品的完成标准固定为“安装包内置 Hermes/Python/Worker，用户无需安装或启动 Hermes”；生产执行改用 ACP，禁止把开发机 PATH Hermes 或 `-z/--safe-mode` 当作产品运行时。
+- **product honesty**：当前 device/project/只读 Worker 仅是开发切片，文档、看板和入口状态明确标为不可用于“开箱即用”验收；后续 M1-M4 必须分别通过 runtime 打包、profile/Key 同步、审批型本机执行和双平台发布证据。
+
 ### 2026-07-24（默认秘书全能力授权修复）
 
 - **fix(capabilities)**：新注册工作区的小秘现在默认拥有能力目录中的全部 41 项能力；无需凭证的能力直接启用，需要外部凭证的能力明确显示为待配置，审批和禁止自动执行的风险门保持不变。
