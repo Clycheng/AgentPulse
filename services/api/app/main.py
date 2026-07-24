@@ -13,6 +13,7 @@ from app.api.routes.channels import router as channels_router
 from app.api.routes.health import router as health_router
 from app.api.routes.ideas import router as ideas_router
 from app.api.routes.model_settings import router as model_settings_router
+from app.api.routes.local_runtime import router as local_runtime_router
 from app.api.routes.memory import router as memory_router
 from app.api.routes.runs import router as runs_router
 from app.api.routes.team_compiler import router as team_compiler_router
@@ -110,6 +111,7 @@ def create_app() -> FastAPI:
     app.include_router(runs_router, prefix="/api")
     app.include_router(ideas_router, prefix="/api")
     app.include_router(model_settings_router, prefix="/api")
+    app.include_router(local_runtime_router, prefix="/api")
     app.include_router(memory_router, prefix="/api")
     app.include_router(channels_router, prefix="/api")
     app.include_router(catalog_router, prefix="/api")

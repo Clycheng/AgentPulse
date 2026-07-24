@@ -21,6 +21,21 @@ declare global {
         set: (value: { accessToken: string; user: User }) => Promise<boolean>;
         clear: () => Promise<boolean>;
       };
+      localRuntime: {
+        start: () => Promise<{ online: boolean; reason?: string; hermes?: string }>;
+        status: () => Promise<{
+          online: boolean;
+          deviceId: string | null;
+          hermes: string;
+          projects: Array<{ id: string; displayName: string; allowedScopes: string[] }>;
+          lastError: string;
+        }>;
+        pickProject: () => Promise<{
+          id: string;
+          display_name: string;
+          path_hash: string;
+        } | null>;
+      };
       obsidian: {
         pickManaged: () => Promise<{
           vault_name: string;
@@ -1223,6 +1238,7 @@ function App() {
   useEffect(() => {
     if (!sessionLoading && token && user) {
       void Promise.all([loadBootstrap(token), loadModelProvider(token)]);
+      void window.agentpulse?.localRuntime.start().catch(() => undefined);
     }
   }, [sessionLoading]);
 
@@ -2453,15 +2469,18 @@ function App() {
         )}
 
         {view === 'settings' && (
-          <ModelProviderSettings
-            status={modelProvider}
-            loading={modelProviderLoading}
-            onConfigure={() => {
-              setModelProviderError('');
-              setModelProviderOpen(true);
-            }}
-            onRevoke={revokeModelProvider}
-          />
+          <>
+            <ModelProviderSettings
+              status={modelProvider}
+              loading={modelProviderLoading}
+              onConfigure={() => {
+                setModelProviderError('');
+                setModelProviderOpen(true);
+              }}
+              onRevoke={revokeModelProvider}
+            />
+            <LocalRuntimePanel />
+          </>
         )}
       </section>
 
@@ -2670,6 +2689,57 @@ function App() {
 
       {toast.visible && <div className="toast">{toast.message}</div>}
     </main>
+  );
+}
+
+function LocalRuntimePanel() {
+  const [status, setStatus] = useState<{
+    online: boolean;
+    hermes: string;
+    projects: Array<{ id: string; displayName: string; allowedScopes: string[] }>;
+    lastError: string;
+  } | null>(null);
+  const refresh = async () => {
+    const current = await window.agentpulse?.localRuntime.status();
+    if (current) setStatus(current);
+  };
+  useEffect(() => {
+    void refresh();
+  }, []);
+  const pickProject = async () => {
+    await window.agentpulse?.localRuntime.start();
+    await window.agentpulse?.localRuntime.pickProject();
+    await refresh();
+  };
+  return (
+    <section className="settings-panel" aria-label="本机执行">
+      <div className="settings-panel-header">
+        <div>
+          <h2>本机 Hermes</h2>
+          <p>读取已授权项目；写入、命令和电脑控制仍需后续审批运行时。</p>
+        </div>
+        <span className={`status-pill ${status?.online ? 'ready' : 'offline'}`}>
+          {status?.online ? '在线' : '未连接'}
+        </span>
+      </div>
+      <div className="settings-panel-row">
+        <span>运行时</span>
+        <code>{status?.hermes || 'Hermes v0.18.2'}</code>
+      </div>
+      <div className="settings-panel-row">
+        <span>授权项目</span>
+        <span>{status?.projects.length ? `${status.projects.length} 个` : '暂无'}</span>
+      </div>
+      <div className="settings-panel-actions">
+        <button className="button secondary" type="button" onClick={() => void refresh()}>
+          刷新状态
+        </button>
+        <button className="button primary" type="button" onClick={() => void pickProject()}>
+          授权项目目录
+        </button>
+      </div>
+      {status?.lastError && <p className="form-error">{status.lastError}</p>}
+    </section>
   );
 }
 

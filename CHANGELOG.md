@@ -459,3 +459,10 @@
 
 老板跟小秘说「帮我建一个市场团队，要内容策划、运营增长、设计师」→ agent 实际调 `create_employee` x3 → 返回结果。
 从此 agent 不再只是"打字"，而是真正能**操作公司系统**。
+### 2026-07-24（TD-14R 真实执行与本机 Worker 第一切片）
+
+- **fix(api)**：DeepSeek DSML 与 OpenAI tool call 统一进入 fail-closed 解析；工具真实进入 handler 后才生成 `execution_receipts`，失败不会继续显示模型的成功话术。
+- **fix(api)**：本机项目请求在没有在线 Worker/授权目录时明确阻塞，禁止通过普通 DeepSeek 回复虚构读取、招聘或任务创建。
+- **feat(api)**：新增 `local_devices`、`local_projects`、Run 的本机执行字段，以及设备 Token、项目授权、Run lease/事件/回执和运行时能力状态接口。
+- **feat(desktop)**：Electron 主进程增加加密设备状态、设备心跳、项目目录选择、只读 Hermes Worker 队列和结果回传；renderer 不接触设备 Token 或绝对路径。
+- **docs**：新增 ADR 0014 与 TD-14R 设计记录，明确 DeerFlow 只借鉴运行时守卫/恢复/沙箱思想，不替换 Hermes 或 AgentPulse 协作层。

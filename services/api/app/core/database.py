@@ -718,6 +718,7 @@ def init_postgres(conn: Database) -> None:
         "('pending_approval','approved','executing','succeeded')"
     )
     _init_td13_tables(conn)
+    _init_td14_tables(conn)
 
 
 def init_sqlite(conn: Database) -> None:
@@ -1230,6 +1231,91 @@ def init_sqlite(conn: Database) -> None:
         "('pending_approval','approved','executing','succeeded')"
     )
     _init_td13_tables(conn)
+    _init_td14_tables(conn)
+
+
+def _init_td14_tables(conn: Database) -> None:
+    """TD-14 durable execution, device and local-project primitives.
+
+    Keep these additive and idempotent so existing SQLite databases and
+    PostgreSQL deployments upgrade in place without relying on the unrelated
+    untracked Alembic directory.
+    """
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS execution_receipts (
+          id TEXT PRIMARY KEY,
+          workspace_id TEXT NOT NULL,
+          run_id TEXT,
+          agent_id TEXT,
+          tool_name TEXT NOT NULL,
+          arguments_json TEXT NOT NULL DEFAULT '{}',
+          arguments_hash TEXT NOT NULL,
+          status TEXT NOT NULL CHECK(status IN ('started','succeeded','failed','rejected')),
+          result_json TEXT NOT NULL DEFAULT '{}',
+          error TEXT NOT NULL DEFAULT '',
+          created_at TEXT NOT NULL,
+          completed_at TEXT
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS local_devices (
+          id TEXT PRIMARY KEY,
+          workspace_id TEXT NOT NULL,
+          user_id TEXT NOT NULL,
+          device_name TEXT NOT NULL DEFAULT '',
+          platform TEXT NOT NULL,
+          architecture TEXT NOT NULL DEFAULT '',
+          worker_version TEXT NOT NULL DEFAULT '',
+          hermes_version TEXT NOT NULL DEFAULT '',
+          status TEXT NOT NULL DEFAULT 'offline'
+            CHECK(status IN ('online','offline','revoked')),
+          device_token_hash TEXT NOT NULL DEFAULT '',
+          token_expires_at TEXT,
+          last_heartbeat_at TEXT,
+          capabilities_json TEXT NOT NULL DEFAULT '{}',
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS local_projects (
+          id TEXT PRIMARY KEY,
+          workspace_id TEXT NOT NULL,
+          device_id TEXT NOT NULL,
+          display_name TEXT NOT NULL,
+          path_hash TEXT NOT NULL,
+          allowed_scopes_json TEXT NOT NULL DEFAULT '["read"]',
+          active INTEGER NOT NULL DEFAULT 1,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL,
+          UNIQUE(device_id, path_hash)
+        )
+        """
+    )
+    ensure_column(conn, "runs", "execution_target", "TEXT NOT NULL DEFAULT 'server'")
+    ensure_column(conn, "runs", "device_id", "TEXT")
+    ensure_column(conn, "runs", "local_project_id", "TEXT")
+    ensure_column(conn, "runs", "runtime_status", "TEXT NOT NULL DEFAULT 'server'")
+    ensure_column(conn, "runs", "execution_receipt_id", "TEXT")
+    ensure_column(conn, "runs", "last_event_id", "INTEGER NOT NULL DEFAULT 0")
+    ensure_column(conn, "runs", "prompt_text", "TEXT NOT NULL DEFAULT ''")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_execution_receipts_run "
+        "ON execution_receipts(run_id, created_at)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_local_devices_workspace "
+        "ON local_devices(workspace_id, status)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_local_projects_workspace "
+        "ON local_projects(workspace_id, active)"
+    )
 
 
 def _init_td13_tables(conn: Database) -> None:

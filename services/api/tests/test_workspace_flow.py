@@ -1851,3 +1851,92 @@ def test_bootstrap_anomaly_count_24h(tmp_path, monkeypatch):
     # is *also* a failed run — counted once each by its own query, so total is
     # 2 failed runs (failed_run, expired_run) + 1 expired approval = 3.
     assert bootstrap["anomaly_count_24h"] == 3
+
+
+def test_local_project_request_never_falls_into_fake_recruitment(tmp_path, monkeypatch):
+    client = make_client(tmp_path, monkeypatch)
+    auth = register_user(client)
+    headers = auth_header(auth["access_token"])
+    bootstrap = client.get("/api/me/bootstrap", headers=headers).json()
+    secretary_chat = next(
+        conversation
+        for conversation in bootstrap["conversations"]
+        if conversation["kind"] == "dm" and conversation["agent_id"] == bootstrap["agents"][0]["id"]
+    )
+
+    response = client.post(
+        f"/api/conversations/{secretary_chat['id']}/messages",
+        headers=headers,
+        json={"content": "/Users/example/Desktop/code/agentpulse 你先看看这个项目"},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["created_agent"] is None
+    assert payload["created_task"] is None
+    assert "尚未执行" in payload["agent_message"]["content"]
+    after = client.get("/api/me/bootstrap", headers=headers).json()
+    assert [agent["name"] for agent in after["agents"]] == [
+        "小秘",
+        "内容策划",
+        "内容主笔",
+        "运营执行",
+    ]
+
+
+def test_local_device_token_and_project_are_workspace_scoped(tmp_path, monkeypatch):
+    client = make_client(tmp_path, monkeypatch)
+    auth = register_user(client)
+    headers = auth_header(auth["access_token"])
+
+    registered = client.post(
+        "/api/local-devices/register",
+        headers=headers,
+        json={
+            "device_name": "测试 Mac",
+            "platform": "darwin",
+            "architecture": "arm64",
+            "worker_version": "test",
+            "hermes_version": "0.18.2",
+            "capabilities": {"read_file": True},
+        },
+    )
+    assert registered.status_code == 200
+    device = registered.json()
+    assert device["device_token"]
+    device_headers = {"Authorization": f"Bearer {device['device_token']}"}
+
+    heartbeat = client.post(
+        f"/api/local-devices/{device['id']}/heartbeat",
+        headers=device_headers,
+        json={"hermes_version": "0.18.2"},
+    )
+    assert heartbeat.status_code == 200
+    assert heartbeat.json()["device_token"]
+
+    project = client.post(
+        "/api/local-projects",
+        headers=headers,
+        json={
+            "device_id": device["id"],
+            "display_name": "agentpulse",
+            "path_hash": "a" * 64,
+            "allowed_scopes": ["read"],
+        },
+    )
+    assert project.status_code == 200
+    assert "path_hash" in project.json()
+
+    status = client.get("/api/local-runtime/status", headers=headers)
+    assert status.status_code == 200
+    assert status.json()["online"] is True
+    assert status.json()["projects"][0]["path_hash"] == "a" * 64
+
+    # The access-token status endpoint never returns the short-lived Worker
+    # secret, and a token from another device cannot claim this device.
+    public_status = client.get(
+        f"/api/local-devices/{device['id']}/status",
+        headers=headers,
+    )
+    assert public_status.status_code == 200
+    assert "device_token" not in public_status.json()

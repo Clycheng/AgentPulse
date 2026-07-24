@@ -95,22 +95,27 @@ def create_run(
     lease_owner: str | None = None,
     lease_expires_at: str | None = None,
     started_at: str | None = None,
+    execution_target: str = "server",
+    device_id: str | None = None,
+    local_project_id: str | None = None,
+    runtime_status: str = "server",
+    prompt_text: str = "",
 ) -> str:
     """Insert a new run row and return its id."""
     if status not in RunStatus.ALL:
         raise RunStateError(f"invalid initial run status: {status}")
     run_id = new_id("run")
-    conn.execute(
-        """
+    sql = """
         INSERT INTO runs (
           id, workspace_id, conversation_id, agent_id, task_id, status,
           input_message_id, output_message_id, hermes_profile_id, hermes_run_id,
           workdir, provider, model, usage_json, error, attempt_no, lease_owner,
-          lease_expires_at, started_at, created_at, completed_at
+          lease_expires_at, started_at, created_at, completed_at,
+          execution_target, device_id, local_project_id, runtime_status, prompt_text
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, '{}', '', ?, ?, ?, ?, ?, NULL)
-        """,
-        (
+        VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, '{}', '', ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?)
+        """
+    params = (
             run_id,
             workspace_id,
             conversation_id,
@@ -128,8 +133,32 @@ def create_run(
             lease_expires_at,
             started_at,
             now_iso(),
-        ),
-    )
+            execution_target,
+            device_id,
+            local_project_id,
+            runtime_status,
+            prompt_text,
+        )
+    try:
+        conn.execute(sql, params)
+    except Exception as exc:
+        # Isolated embedders and lifecycle tests may still construct the
+        # pre-TD-14 minimal runs table. Production startup migration adds the
+        # columns; preserve the old create_run contract for those schemas.
+        if conn.dialect != "sqlite" or "no column named execution_target" not in str(exc):
+            raise
+        conn.execute(
+            """
+            INSERT INTO runs (
+              id, workspace_id, conversation_id, agent_id, task_id, status,
+              input_message_id, output_message_id, hermes_profile_id, hermes_run_id,
+              workdir, provider, model, usage_json, error, attempt_no, lease_owner,
+              lease_expires_at, started_at, created_at, completed_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, '{}', '', ?, ?, ?, ?, ?, NULL)
+            """,
+            params[:17],
+        )
     return run_id
 
 

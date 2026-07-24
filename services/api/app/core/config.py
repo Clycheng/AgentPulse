@@ -64,6 +64,7 @@ class Settings(BaseSettings):
     task_workspace_concurrency: int = 2
     company_tools_url: str = "http://127.0.0.1:8000/mcp/company-tools/"
     company_tool_token_ttl_seconds: int = 900
+    local_device_token_ttl_seconds: int = 900
     business_tools_url: str = "http://127.0.0.1:8000/mcp/business-tools/"
     business_tool_token_ttl_seconds: int = 900
     business_worker_enabled: bool = True

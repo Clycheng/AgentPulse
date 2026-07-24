@@ -1095,6 +1095,66 @@ textarea:focus-visible,
   letter-spacing: 0.2px;
 }
 
+.settings-panel {
+  width: min(100% - 48px, 760px);
+  margin: 0 auto 28px;
+  padding: 20px 24px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--surface);
+}
+
+.settings-panel-header,
+.settings-panel-row,
+.settings-panel-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.settings-panel-header {
+  align-items: flex-start;
+  margin-bottom: 16px;
+}
+
+.settings-panel-header h2 {
+  margin: 0;
+}
+
+.settings-panel-header p,
+.settings-panel-row,
+.settings-panel .form-error {
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.settings-panel-header p {
+  margin: 6px 0 0;
+}
+
+.settings-panel-row {
+  justify-content: flex-start;
+  padding: 9px 0;
+  border-top: 1px solid var(--border-subtle);
+}
+
+.settings-panel-row > :first-child {
+  min-width: 72px;
+  color: var(--text);
+  font-weight: 600;
+}
+
+.settings-panel-actions {
+  justify-content: flex-end;
+  margin-top: 16px;
+}
+
+.settings-panel .form-error {
+  margin: 12px 0 0;
+  color: var(--danger);
+}
+
 .priority-pill {
   width: 32px;
   padding: 2px 0;

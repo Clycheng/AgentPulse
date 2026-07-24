@@ -16,7 +16,7 @@ from app.runtime.runner import (
     resolve_hermes_profile,
     stream_agent_run,
 )
-from app.runtime.runs import RunStatus
+from app.runtime.runs import RunStatus, create_run
 from app.runtime.profile_provisioner import build_provisioner_from_settings
 from app.runtime.reflection import run_reflection
 from app.schemas.run import (
@@ -837,6 +837,109 @@ async def send_message(
         raise HTTPException(status_code=400, detail="没有可回复的智能体")
     task_owner = reply_agents[0]
 
+    from app.services.local_runtime import (
+        online_device,
+        redact_local_paths,
+        requires_local_execution,
+    )
+
+    local_request = payload.execution_target == "local_desktop" or requires_local_execution(
+        payload.content
+    )
+    if local_request:
+        device = online_device(conn, workspace["id"])
+        project_id = payload.local_project_id
+        if device is not None and project_id is None:
+            project = conn.execute(
+                """SELECT id FROM local_projects
+                WHERE workspace_id = ? AND device_id = ? AND active = 1
+                ORDER BY created_at DESC LIMIT 1""",
+                (workspace["id"], device["id"]),
+            ).fetchone()
+            project_id = project["id"] if project else None
+        project = (
+            conn.execute(
+                """SELECT * FROM local_projects
+                WHERE id = ? AND workspace_id = ? AND active = 1""",
+                (project_id, workspace["id"]),
+            ).fetchone()
+            if project_id
+            else None
+        )
+        if device is None or project is None or project["device_id"] != device["id"]:
+            reason = (
+                "本机 Worker 未连接"
+                if device is None
+                else "尚未授权本机项目目录"
+            )
+            user_message = add_message(
+                conn,
+                conversation_id=conversation_id,
+                sender_type="user",
+                sender_id=current_user["id"],
+                content=payload.content,
+            )
+            blocked = add_message(
+                conn,
+                conversation_id=conversation_id,
+                sender_type="agent",
+                sender_id=task_owner["id"],
+                content=f"尚未执行：{reason}。系统没有读取文件、运行命令或创建替代员工。",
+                provider="agentpulse",
+                model="",
+            )
+            conn.commit()
+            return {
+                "user_message": serialize_message(user_message),
+                "agent_message": serialize_message(blocked),
+                "agent_messages": [serialize_message(blocked)],
+                "created_task": None,
+                "created_agent": None,
+            }
+        run_id = create_run(
+            conn,
+            workspace_id=workspace["id"],
+            conversation_id=conversation_id,
+            agent_id=task_owner["id"],
+            input_message_id=None,
+            hermes_profile_id=resolve_hermes_profile(conn, task_owner["id"]),
+            provider="hermes",
+            status=RunStatus.QUEUED,
+            execution_target="local_desktop",
+            device_id=device["id"],
+            local_project_id=project["id"],
+            runtime_status="queued",
+            prompt_text=redact_local_paths(payload.content),
+        )
+        user_message = add_message(
+            conn,
+            conversation_id=conversation_id,
+            sender_type="user",
+            sender_id=current_user["id"],
+            content=payload.content,
+        )
+        conn.execute(
+            "UPDATE runs SET input_message_id = ? WHERE id = ?",
+            (user_message["id"], run_id),
+        )
+        queued = add_message(
+            conn,
+            conversation_id=conversation_id,
+            sender_type="agent",
+            sender_id=task_owner["id"],
+            content=f"已排队等待本机 Hermes Worker 执行（Run {run_id}）。当前尚未读取文件。",
+            provider="agentpulse",
+            model="",
+        )
+        conn.commit()
+        return {
+            "user_message": serialize_message(user_message),
+            "agent_message": serialize_message(queued),
+            "agent_messages": [serialize_message(queued)],
+            "created_task": None,
+            "created_agent": None,
+        }
+
     user_message = add_message(
         conn,
         conversation_id=conversation_id,
@@ -1015,6 +1118,130 @@ async def send_message_stream(
     reply_agents = resolve_reply_agents(conn, workspace["id"], conversation, payload)
     if not reply_agents:
         raise HTTPException(status_code=400, detail="没有可回复的智能体")
+
+    from app.services.local_runtime import (
+        online_device,
+        redact_local_paths,
+        requires_local_execution,
+    )
+
+    local_request = payload.execution_target == "local_desktop" or requires_local_execution(
+        payload.content
+    )
+    if local_request:
+        device = online_device(conn, workspace["id"])
+        project_id = payload.local_project_id
+        if device is not None and project_id is None:
+            project = conn.execute(
+                """SELECT id FROM local_projects
+                WHERE workspace_id = ? AND device_id = ? AND active = 1
+                ORDER BY created_at DESC LIMIT 1""",
+                (workspace["id"], device["id"]),
+            ).fetchone()
+            project_id = project["id"] if project else None
+        project = (
+            conn.execute(
+                """SELECT * FROM local_projects
+                WHERE id = ? AND workspace_id = ? AND active = 1""",
+                (project_id, workspace["id"]),
+            ).fetchone()
+            if project_id
+            else None
+        )
+        if device is None or project is None or project["device_id"] != device["id"]:
+            user_message = add_message(
+                conn,
+                conversation_id=conversation_id,
+                sender_type="user",
+                sender_id=current_user["id"],
+                content=payload.content,
+            )
+            blocked = add_message(
+                conn,
+                conversation_id=conversation_id,
+                sender_type="agent",
+                sender_id=reply_agents[0]["id"],
+                content=(
+                    "尚未执行："
+                    + ("本机 Worker 未连接。" if device is None else "尚未授权本机项目目录。")
+                    + "系统没有读取文件、运行命令或创建替代员工。"
+                ),
+                provider="agentpulse",
+                model="",
+            )
+            conn.commit()
+
+            async def blocked_generator():
+                yield f"event: user_message\ndata: {json.dumps(serialize_message(user_message), ensure_ascii=False)}\n\n"
+                yield f"event: speaking\ndata: {json.dumps({'agent_id': reply_agents[0]['id'], 'agent_name': reply_agents[0]['name'], 'agent_role': reply_agents[0]['role']}, ensure_ascii=False)}\n\n"
+                yield f"event: chunk\ndata: {json.dumps({'content': blocked['content']}, ensure_ascii=False)}\n\n"
+                yield f"event: done\ndata: {json.dumps(serialize_message(blocked), ensure_ascii=False)}\n\n"
+                yield "event: end\ndata: {}\n\n"
+
+            return StreamingResponse(
+                blocked_generator(),
+                media_type="text/event-stream",
+                headers={
+                    "Cache-Control": "no-cache",
+                    "Connection": "keep-alive",
+                    "X-Accel-Buffering": "no",
+                },
+            )
+
+        user_message = add_message(
+            conn,
+            conversation_id=conversation_id,
+            sender_type="user",
+            sender_id=current_user["id"],
+            content=payload.content,
+        )
+        run_id = create_run(
+            conn,
+            workspace_id=workspace["id"],
+            conversation_id=conversation_id,
+            agent_id=reply_agents[0]["id"],
+            input_message_id=None,
+            hermes_profile_id=resolve_hermes_profile(conn, reply_agents[0]["id"]),
+            provider="hermes",
+            status=RunStatus.QUEUED,
+            execution_target="local_desktop",
+            device_id=device["id"],
+            local_project_id=project["id"],
+            runtime_status="queued",
+            prompt_text=redact_local_paths(payload.content),
+        )
+        conn.execute(
+            "UPDATE runs SET input_message_id = ? WHERE id = ?",
+            (user_message["id"], run_id),
+        )
+        queued = add_message(
+            conn,
+            conversation_id=conversation_id,
+            sender_type="agent",
+            sender_id=reply_agents[0]["id"],
+            content=f"已排队等待本机 Hermes Worker 执行（Run {run_id}）。当前尚未读取文件。",
+            provider="agentpulse",
+            model="",
+        )
+        conn.commit()
+
+        async def queued_generator():
+            yield f"event: user_message\ndata: {json.dumps(serialize_message(user_message), ensure_ascii=False)}\n\n"
+            yield f"event: speaking\ndata: {json.dumps({'agent_id': reply_agents[0]['id'], 'agent_name': reply_agents[0]['name'], 'agent_role': reply_agents[0]['role']}, ensure_ascii=False)}\n\n"
+            yield f"event: status\ndata: {json.dumps({'run_id': run_id, 'status': 'queued', 'execution_target': 'local_desktop'}, ensure_ascii=False)}\n\n"
+            yield f"event: chunk\ndata: {json.dumps({'content': queued['content']}, ensure_ascii=False)}\n\n"
+            yield f"event: done\ndata: {json.dumps(serialize_message(queued), ensure_ascii=False)}\n\n"
+            yield "event: end\ndata: {}\n\n"
+
+        return StreamingResponse(
+            queued_generator(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+            },
+        )
 
     user_message = add_message(
         conn,
@@ -1734,6 +1961,36 @@ async def _stream_reply_events(
     """
     profile = resolve_hermes_profile(conn, agent["id"])
     is_secretary = agent.get("source") == "system_secretary"
+
+    # A server-side Hermes profile cannot see the owner's computer. Stop local
+    # requests before the company Action Bridge gets a chance to invent a
+    # workaround employee or a successful-looking text response.
+    from app.services.local_runtime import (
+        local_runtime_online,
+        requires_local_execution,
+    )
+
+    if requires_local_execution(user_message["content"]) and not local_runtime_online(
+        conn, workspace["id"]
+    ):
+        blocked = (
+            "尚未执行：这个请求需要访问老板本机，但当前没有连接本机 Hermes Worker。"
+            "请先在桌面端授权项目目录并保持 Worker 在线；系统没有读取文件、运行命令或创建替代员工。"
+        )
+        message = add_message(
+            conn,
+            conversation_id=conversation["id"],
+            sender_type="agent",
+            sender_id=agent["id"],
+            content=blocked,
+            provider="agentpulse",
+            model="",
+        )
+        conn.commit()
+        yield {"type": "chunk", "content": blocked}
+        yield {"type": "message", "message": message}
+        return
+
     if profile and (not is_secretary or not allow_action_bridge):
         async for event in _stream_hermes_reply(
             conn,

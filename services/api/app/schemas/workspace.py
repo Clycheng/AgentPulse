@@ -182,6 +182,8 @@ class BootstrapResponse(BaseModel):
 class SendMessageRequest(BaseModel):
     content: str = Field(min_length=1, max_length=12000)
     target_agent_id: str | None = None
+    local_project_id: str | None = None
+    execution_target: Literal["server", "local_desktop"] = "server"
 
 
 class SendMessageResponse(BaseModel):

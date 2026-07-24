@@ -16,6 +16,8 @@ from typing import Any, Callable
 
 from app.core.database import Database, Row
 from app.orchestration.capability_catalog import CATALOG
+from app.runtime.runtime_guard import bounded_tool_output
+from app.services.execution_receipts import begin_receipt, finish_receipt
 from app.services.workspace import (
     add_message,
     claim_task,
@@ -43,6 +45,7 @@ class ToolCall:
     id: str
     name: str
     arguments: dict = field(default_factory=dict)
+    parse_error: str = ""
 
 
 @dataclass
@@ -51,6 +54,9 @@ class ToolResult:
     tool_call_id: str
     name: str
     content: str  # JSON string or human-readable text
+    ok: bool = False
+    execution_receipt_id: str | None = None
+    result: Any = None
 
 
 # ---------------------------------------------------------------------------
@@ -869,22 +875,170 @@ async def execute_tool(
     workspace_id: str,
     agent: Row,
     tool_call: ToolCall,
+    *,
+    run_id: str | None = None,
 ) -> ToolResult:
-    """Execute a single tool call and return the result."""
+    """Execute a single tool call with a durable truth-bearing receipt."""
+    receipt_id = begin_receipt(
+        conn,
+        workspace_id=workspace_id,
+        agent_id=agent.get("id"),
+        tool_name=tool_call.name,
+        arguments=tool_call.arguments,
+        run_id=run_id,
+    )
+
+    validation_error = _validate_tool_call(tool_call)
+    if validation_error:
+        finish_receipt(
+            conn,
+            receipt_id,
+            status="rejected",
+            error=validation_error,
+        )
+        return _tool_result(
+            tool_call,
+            ok=False,
+            result=None,
+            receipt_id=receipt_id,
+            error=validation_error,
+        )
+
     handler = HANDLER_MAP.get(tool_call.name)
     if handler is None:
-        content = json.dumps({"error": f"未知工具: {tool_call.name}"})
-    else:
-        try:
-            content = await handler(conn, workspace_id, agent, tool_call.arguments)
-        except Exception as exc:
-            content = json.dumps({"error": f"工具执行失败: {exc}"})
+        error = f"未知工具: {tool_call.name}"
+        finish_receipt(conn, receipt_id, status="rejected", error=error)
+        return _tool_result(
+            tool_call,
+            ok=False,
+            result=None,
+            receipt_id=receipt_id,
+            error=error,
+        )
 
+    try:
+        raw_content = await handler(conn, workspace_id, agent, tool_call.arguments)
+        try:
+            result = json.loads(raw_content)
+        except (TypeError, json.JSONDecodeError):
+            result = {"text": str(raw_content)}
+        error = ""
+        if isinstance(result, dict) and result.get("error"):
+            error = str(result["error"])
+        ok = not error and not (
+            isinstance(result, dict) and result.get("success") is False
+        )
+        finish_receipt(
+            conn,
+            receipt_id,
+            status="succeeded" if ok else "failed",
+            result=result,
+            error=error,
+        )
+        return _tool_result(
+            tool_call,
+            ok=ok,
+            result=result if ok else None,
+            receipt_id=receipt_id,
+            error=error,
+        )
+    except Exception as exc:
+        error = f"工具执行失败: {exc}"
+        finish_receipt(conn, receipt_id, status="failed", error=error)
+        return _tool_result(
+            tool_call,
+            ok=False,
+            result=None,
+            receipt_id=receipt_id,
+            error=error,
+        )
+
+
+def _tool_result(
+    tool_call: ToolCall,
+    *,
+    ok: bool,
+    result: Any,
+    receipt_id: str,
+    error: str = "",
+) -> ToolResult:
+    envelope: dict[str, Any] = {
+        "ok": ok,
+        "tool": tool_call.name,
+        "result": result,
+        "execution_receipt_id": receipt_id,
+    }
+    if error:
+        envelope["error"] = error
+    # Preserve the old top-level fields for existing MCP/bridge consumers while
+    # making the new envelope authoritative.
+    if isinstance(result, dict):
+        envelope.update(result)
+    encoded = json.dumps(envelope, ensure_ascii=False)
+    if len(encoded) > 20_000:
+        envelope["result"] = {
+            "truncated": True,
+            "preview": bounded_tool_output(result),
+        }
     return ToolResult(
         tool_call_id=tool_call.id,
         name=tool_call.name,
-        content=content,
+        content=json.dumps(envelope, ensure_ascii=False),
+        ok=ok,
+        execution_receipt_id=receipt_id,
+        result=result,
     )
+
+
+def _validate_tool_call(tool_call: ToolCall) -> str | None:
+    if tool_call.parse_error:
+        return f"工具调用参数解析失败，未执行：{tool_call.parse_error}"
+    if not tool_call.name:
+        return "工具名称为空，未执行"
+    if not isinstance(tool_call.arguments, dict):
+        return "工具参数必须是 JSON 对象，未执行"
+    definition = next(
+        (
+            item["function"]
+            for item in TOOLS
+            if item.get("function", {}).get("name") == tool_call.name
+        ),
+        None,
+    )
+    if definition is None:
+        return f"未知工具: {tool_call.name}"
+    schema = definition.get("parameters") or {}
+    properties = schema.get("properties") or {}
+    required_messages = {
+        "name": "员工名字不能为空",
+        "role": "岗位名称不能为空",
+        "title": "任务标题不能为空",
+        "description": "任务描述不能为空",
+    }
+    for required in schema.get("required") or []:
+        if required not in tool_call.arguments:
+            return required_messages.get(required, f"缺少必填参数: {required}")
+    for name, value in tool_call.arguments.items():
+        spec = properties.get(name)
+        if not spec:
+            continue
+        expected = spec.get("type")
+        valid = (
+            expected == "string" and isinstance(value, str)
+        ) or (
+            expected == "boolean" and isinstance(value, bool)
+        ) or (
+            expected == "array" and isinstance(value, list)
+        ) or (
+            expected == "object" and isinstance(value, dict)
+        ) or (
+            expected == "integer" and isinstance(value, int) and not isinstance(value, bool)
+        )
+        if expected and not valid:
+            return f"参数 {name} 类型错误，应为 {expected}"
+        if spec.get("enum") and value not in spec["enum"]:
+            return f"参数 {name} 不是允许的值"
+    return None
 
 
 def system_prompt_for_operator(

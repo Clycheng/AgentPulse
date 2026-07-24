@@ -22,6 +22,8 @@ from typing import Any
 import httpx
 
 from app.core.database import Database, Row
+from app.runtime.dsml import parse_dsml
+from app.runtime.runtime_guard import final_reply_is_grounded
 from app.schemas.run import LlmChatMessage
 from app.tools.registry import (
     TOOLS,
@@ -99,19 +101,35 @@ async def _run_rounds(
 ) -> AsyncGenerator[dict, None]:
     for round_num in range(MAX_TOOL_ROUNDS):
         try:
-            content_text, tool_calls = "", []
+            content_text, tool_calls, parse_error = "", [], ""
             async for ev in _stream_llm_round(client, messages):
                 if ev["type"] == "chunk":
                     content_text += ev["content"]
-                    yield ev
                 elif ev["type"] == "_tool_calls":
                     tool_calls = ev["tool_calls"]
+                elif ev["type"] == "_parse_error":
+                    parse_error = ev["detail"]
                 elif ev["type"] == "_error":
                     raise RuntimeError(ev["detail"])
         except Exception:
-            break
+            # Transport/provider errors are not tool execution. Leave the
+            # caller an empty bridge result so it can use its existing honest
+            # non-tool fallback; no success text or receipt is produced here.
+            yield {"type": "_bridge_error"}
+            return
+
+        if parse_error:
+            yield {
+                "type": "chunk",
+                "content": f"未执行：{parse_error}。未发生任何系统变更。",
+            }
+            return
 
         if not tool_calls:
+            if content_text:
+                if not final_reply_is_grounded(content_text, execution_receipts=0):
+                    content_text = "未执行：模型没有产生真实工具调用，因此系统没有把这段话当作完成结果。"
+                yield {"type": "chunk", "content": content_text}
             return
 
         # Record the assistant's tool_calls turn for the next round's context
@@ -128,17 +146,48 @@ async def _run_rounds(
             ],
         })
 
-        for tc in tool_calls:
-            yield {"type": "tool_call", "name": tc.name, "args": tc.arguments}
-
         tool_results: list[ToolResult] = []
         for tc in tool_calls:
             result = await execute_tool(conn, workspace_id, agent, tc)
             tool_results.append(result)
-            yield {"type": "tool_result", "name": result.name, "result": result.content}
+            # Emit tool_call only after the server has entered the validated
+            # execution path and produced a receipt. This prevents UI traces
+            # from claiming that an unvalidated model fragment ran.
+            yield {
+                "type": "tool_call",
+                "name": result.name,
+                "args": tc.arguments,
+                "ok": result.ok,
+                "execution_receipt_id": result.execution_receipt_id,
+            }
+            yield {
+                "type": "tool_result",
+                "name": result.name,
+                "result": result.content,
+                "ok": result.ok,
+                "execution_receipt_id": result.execution_receipt_id,
+            }
 
         # Persist tool execution results to database
         conn.commit()
+
+        failed = [result for result in tool_results if not result.ok]
+        if failed:
+            summary = "；".join(
+                f"{result.name}: {json.loads(result.content).get('error', '执行失败')}"
+                for result in failed
+            )
+            yield {
+                "type": "chunk",
+                "content": f"未完成：{summary}。系统没有把失败操作当作成功。",
+            }
+            return
+
+        # Text emitted alongside a tool call is held back until every handler
+        # has succeeded. A model cannot get a visible "已完成" sentence ahead
+        # of a failed or rejected tool.
+        if content_text:
+            yield {"type": "chunk", "content": content_text}
 
         for tr in tool_results:
             messages.append({
@@ -149,9 +198,19 @@ async def _run_rounds(
 
     # Max rounds reached — do one final streamed completion without tools
     try:
+        final_text = ""
         async for ev in _stream_llm_round(client, messages, with_tools=False):
             if ev["type"] == "chunk":
-                yield ev
+                final_text += ev["content"]
+        if final_text:
+            yield {
+                "type": "chunk",
+                "content": (
+                    final_text
+                    if final_reply_is_grounded(final_text, execution_receipts=1)
+                    else "未执行：模型没有产生真实工具调用，因此系统没有把这段话当作完成结果。"
+                ),
+            }
     except Exception:
         pass
 
@@ -176,6 +235,7 @@ async def _stream_llm_round(
         payload["tools"] = TOOLS
 
     tool_call_builders: dict[int, dict[str, Any]] = {}
+    content_parts: list[str] = []
 
     async with httpx.AsyncClient(timeout=client.timeout_seconds, trust_env=False) as http:
         async with http.stream(
@@ -206,7 +266,7 @@ async def _stream_llm_round(
 
                 content = delta.get("content")
                 if content:
-                    yield {"type": "chunk", "content": content}
+                    content_parts.append(str(content))
 
                 for tc_delta in delta.get("tool_calls") or []:
                     idx = tc_delta.get("index", 0)
@@ -221,15 +281,40 @@ async def _stream_llm_round(
                     if func.get("arguments"):
                         builder["arguments"] += func["arguments"]
 
+    raw_text = "".join(content_parts)
+    dsml = parse_dsml(raw_text)
+    if dsml.marker_found and dsml.errors:
+        yield {"type": "_parse_error", "detail": "；".join(dsml.errors)}
+        return
+    if dsml.marker_found and dsml.clean_text:
+        yield {"type": "chunk", "content": dsml.clean_text}
+    elif not dsml.marker_found and raw_text:
+        yield {"type": "chunk", "content": raw_text}
+
     tool_calls: list[ToolCall] = []
     for builder in tool_call_builders.values():
         if not builder["id"] or not builder["name"]:
             continue
+        parse_error = ""
         try:
             args = json.loads(builder["arguments"]) if builder["arguments"] else {}
-        except (json.JSONDecodeError, TypeError):
+        except (json.JSONDecodeError, TypeError) as exc:
             args = {}
-        tool_calls.append(ToolCall(id=builder["id"], name=builder["name"], arguments=args))
+            parse_error = f"{builder['name']} 参数不是合法 JSON: {exc}"
+        tool_calls.append(
+            ToolCall(
+                id=builder["id"],
+                name=builder["name"],
+                arguments=args,
+                parse_error=parse_error,
+            )
+        )
+
+    if dsml.marker_found and not dsml.errors:
+        tool_calls.extend(
+            ToolCall(id=call["id"], name=call["name"], arguments=call["arguments"])
+            for call in dsml.calls
+        )
 
     yield {"type": "_tool_calls", "tool_calls": tool_calls}
 
@@ -245,10 +330,12 @@ def _extract_tool_calls(message: dict[str, Any]) -> list[ToolCall]:
         raw_args = func.get("arguments", "{}")
         try:
             args = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
-        except (json.JSONDecodeError, TypeError):
+            parse_error = ""
+        except (json.JSONDecodeError, TypeError) as exc:
             args = {}
+            parse_error = f"参数不是合法 JSON: {exc}"
         if name and fid:
-            result.append(ToolCall(id=fid, name=name, arguments=args))
+            result.append(ToolCall(id=fid, name=name, arguments=args, parse_error=parse_error))
     return result
 
 

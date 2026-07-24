@@ -113,6 +113,12 @@ Hermes 能力感知**自动路由**：主模型能看图就原生看；主模型
 
 技术危险动作审批门后来已用真实 Hermes ACP 的删除操作验证批准、拒绝和超时三条路径；业务风险不依赖 Hermes 识别，统一走 ADR 0011 的持久业务动作门。
 
+### 3.11 本机执行边界（TD-14R）
+
+服务端 Hermes 只能看到服务端 workdir，不能读取老板电脑。需要本机文件或电脑能力时，API 创建绑定 `workspace/device/local_project` 的持久 Run，由 Electron 主进程 Worker 领取并在用户授权目录执行。设备 Token 和本机绝对路径只保存在主进程安全存储；API 仅保存设备、项目显示名、路径哈希和授权范围。
+
+本机第一切片只执行只读项目分析，并通过 `execution_receipts`、Run lease 和事件接口回传事实。写文件、终端、浏览器登录、computer_use 和业务外部动作仍需审批运行时。没有 Worker、项目授权、Hermes profile 或真实最终产出时，Run 必须阻塞/失败，聊天不能把模型文本当作完成凭证。
+
 ## 4. 群讨论协议（自研 · 照 AutoGen 骨架）
 
 Hermes 不做多 agent 围坐讨论；Multica 的"协作"只是 leader 派活(delegation)。**所以群讨论是 AgentPulse 自研的核心。** AutoGen 已验证需要哪些零件：

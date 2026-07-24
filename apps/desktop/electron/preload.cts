@@ -20,6 +20,11 @@ contextBridge.exposeInMainWorld('agentpulse', {
       ipcRenderer.invoke('agentpulse:session:set', value),
     clear: () => ipcRenderer.invoke('agentpulse:session:clear'),
   },
+  localRuntime: {
+    start: () => ipcRenderer.invoke('agentpulse:local-runtime:start'),
+    status: () => ipcRenderer.invoke('agentpulse:local-runtime:status'),
+    pickProject: () => ipcRenderer.invoke('agentpulse:local-project:pick'),
+  },
   obsidian: {
     pickManaged: (): Promise<{
       vault_name: string;
