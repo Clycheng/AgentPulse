@@ -16,40 +16,33 @@ from typing import Any
 
 CONTROL_MARKERS = ("<｜｜DSML｜｜", "<|DSML|>")
 MAX_TOOL_OUTPUT = 20_000
-MAX_ARGUMENT_TEXT = 12_000
-
-
-def normalize_tool_arguments(value: Any) -> tuple[dict[str, Any], str | None]:
-    if isinstance(value, dict):
-        return value, None
-    if not isinstance(value, str):
-        return {}, "工具参数必须是 JSON 对象"
-    if len(value) > MAX_ARGUMENT_TEXT:
-        return {}, "工具参数超过大小限制"
-    try:
-        parsed = json.loads(value)
-    except json.JSONDecodeError as exc:
-        return {}, f"工具参数不是合法 JSON: {exc.msg}"
-    if not isinstance(parsed, dict):
-        return {}, "工具参数必须是 JSON 对象"
-    return parsed, None
-
-
 def safe_project_path(project_root: str, requested: str) -> Path:
     """Resolve a project-relative path and reject traversal/symlink escape."""
     root = Path(project_root).expanduser().resolve(strict=True)
+    if not requested or "\x00" in requested:
+        raise ValueError("路径无效")
     candidate = Path(requested)
-    if candidate.is_absolute():
-        resolved = candidate.resolve(strict=False)
-    else:
-        resolved = (root / candidate).resolve(strict=False)
+    lexical = candidate if candidate.is_absolute() else root / candidate
+    try:
+        relative = lexical.relative_to(root)
+    except ValueError as exc:
+        raise ValueError("路径超出已授权项目目录") from exc
+    if ".." in relative.parts:
+        raise ValueError("不允许路径穿越")
+
+    # Inspect existing path components before resolving. After resolve() the
+    # symlink itself has disappeared, so a late check cannot enforce policy.
+    current = root
+    for part in relative.parts:
+        current = current / part
+        if current.is_symlink():
+            target = current.resolve(strict=False)
+            if target != root and root not in target.parents:
+                raise ValueError("不允许通过符号链接逃逸项目目录")
+
+    resolved = lexical.resolve(strict=False)
     if resolved != root and root not in resolved.parents:
         raise ValueError("路径超出已授权项目目录")
-    current = resolved
-    while current != root:
-        if current.is_symlink():
-            raise ValueError("不允许通过符号链接逃逸项目目录")
-        current = current.parent
     return resolved
 
 

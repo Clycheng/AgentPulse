@@ -16,7 +16,8 @@ from app.channels.adapters import UnsupportedChannelError
 from app.channels.router import route_inbound
 from app.core.database import Database, get_db
 from app.core.config import settings
-from app.runtime.deepseek import DeepSeekAPIError, DeepSeekNotConfigured
+from app.runtime.hermes_client import HermesBackendError
+from app.services.model_credentials import ModelCredentialError
 from app.services.channels import get_channel_by_token, verify_signature
 
 router = APIRouter(tags=["webhooks"])
@@ -108,6 +109,6 @@ async def _maybe_reply(
             agent=agent,
             user_message=user_message,
         )
-    except (DeepSeekNotConfigured, DeepSeekAPIError):
+    except (HermesBackendError, ModelCredentialError):
         return False
     return True

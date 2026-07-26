@@ -576,9 +576,13 @@ def test_chat_and_task_runs_receive_isolated_business_mcp(tmp_path, monkeypatch)
             )
         )
         assert [server["name"] for server in chat_ctx.mcp_servers] == [
-            "agentpulse-business"
+            "agentpulse-company",
+            "agentpulse-business",
         ]
-        chat_token = chat_ctx.mcp_servers[0]["headers"]["Authorization"].split()[1]
+        chat_token = next(
+            server for server in chat_ctx.mcp_servers
+            if server["name"] == "agentpulse-business"
+        )["headers"]["Authorization"].split()[1]
         assert decode_business_tool_token(chat_token)["task_id"] is None
 
         task = create_task(

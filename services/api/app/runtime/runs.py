@@ -23,31 +23,123 @@ class RunStatus:
     """Run lifecycle states (DATA-MODEL §5.1)."""
 
     QUEUED = "queued"
+    LEASED = "leased"
     RUNNING = "running"
+    PAUSING = "pausing"
+    PAUSED = "paused"
+    WAITING_APPROVAL = "waiting_approval"
+    WAITING_INFORMATION = "waiting_information"
+    WAITING_COLLEAGUE = "waiting_colleague"
     WAITING_USER = "waiting_user"       # high-risk action pending owner approval
     WAITING_CLARIFY = "waiting_clarify"  # agent paused to ask for missing context
     COMPLETED = "completed"
     FAILED = "failed"
+    CANCELLED = "cancelled"
+    TIMED_OUT = "timed_out"
 
-    ALL = (QUEUED, RUNNING, WAITING_USER, WAITING_CLARIFY, COMPLETED, FAILED)
-    TERMINAL = (COMPLETED, FAILED)
+    ALL = (
+        QUEUED,
+        LEASED,
+        RUNNING,
+        PAUSING,
+        PAUSED,
+        WAITING_APPROVAL,
+        WAITING_INFORMATION,
+        WAITING_COLLEAGUE,
+        WAITING_USER,
+        WAITING_CLARIFY,
+        COMPLETED,
+        FAILED,
+        CANCELLED,
+        TIMED_OUT,
+    )
+    TERMINAL = (COMPLETED, FAILED, CANCELLED, TIMED_OUT)
+    FOREGROUND = (LEASED, RUNNING, PAUSING)
+    WAITING = (
+        WAITING_APPROVAL,
+        WAITING_INFORMATION,
+        WAITING_COLLEAGUE,
+        WAITING_USER,
+        WAITING_CLARIFY,
+    )
 
 
 # Allowed transitions. Anything not listed here is rejected by transition_run so
 # an out-of-order Hermes event stream can't silently corrupt run state.
 ALLOWED_TRANSITIONS: dict[str, set[str]] = {
-    RunStatus.QUEUED: {RunStatus.RUNNING, RunStatus.FAILED},
+    RunStatus.QUEUED: {
+        RunStatus.LEASED,
+        RunStatus.RUNNING,
+        RunStatus.PAUSED,
+        RunStatus.FAILED,
+        RunStatus.CANCELLED,
+        RunStatus.TIMED_OUT,
+    },
+    RunStatus.LEASED: {
+        RunStatus.QUEUED,
+        RunStatus.RUNNING,
+        RunStatus.PAUSED,
+        RunStatus.FAILED,
+        RunStatus.CANCELLED,
+        RunStatus.TIMED_OUT,
+    },
     RunStatus.RUNNING: {
+        RunStatus.PAUSING,
+        RunStatus.PAUSED,
+        RunStatus.WAITING_APPROVAL,
+        RunStatus.WAITING_INFORMATION,
+        RunStatus.WAITING_COLLEAGUE,
         RunStatus.WAITING_USER,
         RunStatus.WAITING_CLARIFY,
         RunStatus.COMPLETED,
         RunStatus.FAILED,
+        RunStatus.CANCELLED,
+        RunStatus.TIMED_OUT,
+    },
+    RunStatus.PAUSING: {
+        RunStatus.RUNNING,
+        RunStatus.PAUSED,
+        RunStatus.FAILED,
+        RunStatus.CANCELLED,
+        RunStatus.TIMED_OUT,
+    },
+    RunStatus.PAUSED: {
+        RunStatus.QUEUED,
+        RunStatus.LEASED,
+        RunStatus.RUNNING,
+        RunStatus.FAILED,
+        RunStatus.CANCELLED,
     },
     # Resume after the owner approves / answers, or fail (rejected / stopped / timeout).
     RunStatus.WAITING_USER: {RunStatus.RUNNING, RunStatus.COMPLETED, RunStatus.FAILED},
     RunStatus.WAITING_CLARIFY: {RunStatus.RUNNING, RunStatus.COMPLETED, RunStatus.FAILED},
+    RunStatus.WAITING_APPROVAL: {
+        RunStatus.RUNNING,
+        RunStatus.PAUSED,
+        RunStatus.COMPLETED,
+        RunStatus.FAILED,
+        RunStatus.CANCELLED,
+    },
+    RunStatus.WAITING_INFORMATION: {
+        RunStatus.QUEUED,
+        RunStatus.RUNNING,
+        RunStatus.PAUSED,
+        RunStatus.COMPLETED,
+        RunStatus.FAILED,
+        RunStatus.CANCELLED,
+    },
+    RunStatus.WAITING_COLLEAGUE: {
+        RunStatus.QUEUED,
+        RunStatus.RUNNING,
+        RunStatus.PAUSED,
+        RunStatus.COMPLETED,
+        RunStatus.FAILED,
+        RunStatus.CANCELLED,
+    },
     RunStatus.COMPLETED: set(),
     RunStatus.FAILED: set(),
+    RunStatus.CANCELLED: set(),
+    RunStatus.TIMED_OUT: set(),
 }
 
 
@@ -98,8 +190,12 @@ def create_run(
     execution_target: str = "server",
     device_id: str | None = None,
     local_project_id: str | None = None,
-    runtime_status: str = "server",
+    runtime_status: str | None = None,
     prompt_text: str = "",
+    run_kind: str | None = None,
+    hermes_session_id: str | None = None,
+    resource_requirements: list[dict] | None = None,
+    resume_of_run_id: str | None = None,
 ) -> str:
     """Insert a new run row and return its id."""
     if status not in RunStatus.ALL:
@@ -136,7 +232,7 @@ def create_run(
             execution_target,
             device_id,
             local_project_id,
-            runtime_status,
+            runtime_status or status,
             prompt_text,
         )
     try:
@@ -159,6 +255,23 @@ def create_run(
             """,
             params[:17],
         )
+    # TD-15 columns are additive so older isolated lifecycle tables still use
+    # the original create contract while production records the richer state.
+    try:
+        conn.execute(
+            """UPDATE runs SET run_kind = ?, hermes_session_id = ?,
+            resource_requirements_json = ?, resume_of_run_id = ? WHERE id = ?""",
+            (
+                run_kind or ("task" if task_id else "chat"),
+                hermes_session_id,
+                json.dumps(resource_requirements or [], ensure_ascii=False),
+                resume_of_run_id,
+                run_id,
+            ),
+        )
+    except Exception as exc:
+        if "no such column" not in str(exc):
+            raise
     return run_id
 
 
@@ -193,26 +306,49 @@ def transition_run(
         raise RunStateError(f"illegal run transition: {current} -> {to_status}")
 
     completed_at = now_iso() if to_status in RunStatus.TERMINAL else None
-    conn.execute(
-        """
+    sql = """
         UPDATE runs SET
           status = ?,
+          runtime_status = ?,
           error = COALESCE(?, error),
           output_message_id = COALESCE(?, output_message_id),
           hermes_run_id = COALESCE(?, hermes_run_id),
-          completed_at = CASE WHEN ? IS NULL THEN completed_at ELSE ? END
+          completed_at = COALESCE(?, completed_at)
         WHERE id = ?
-        """,
-        (
+        """
+    params = (
+            to_status,
             to_status,
             error,
             output_message_id,
             hermes_run_id,
             completed_at,
-            completed_at,
             run_id,
-        ),
-    )
+        )
+    try:
+        conn.execute(sql, params)
+    except Exception as exc:
+        if conn.dialect != "sqlite" or "no such column: runtime_status" not in str(exc):
+            raise
+        conn.execute(
+            """
+            UPDATE runs SET
+              status = ?,
+              error = COALESCE(?, error),
+              output_message_id = COALESCE(?, output_message_id),
+              hermes_run_id = COALESCE(?, hermes_run_id),
+              completed_at = COALESCE(?, completed_at)
+            WHERE id = ?
+            """,
+            (
+                to_status,
+                error,
+                output_message_id,
+                hermes_run_id,
+                completed_at,
+                run_id,
+            ),
+        )
     return get_run(conn, run_id)  # type: ignore[return-value]
 
 

@@ -1,8 +1,4 @@
-"""Runtime layer for AgentPulse.
-
-- DeepSeek chat client (temporary execution layer)
-- Profile provisioner abstraction (Hermes profile management)
-"""
+"""Runtime layer for AgentPulse: Hermes ACP and profile provisioning."""
 
 from app.runtime.profile_provisioner import (
     ProfileProvisioner,

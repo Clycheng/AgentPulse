@@ -8,6 +8,7 @@ import os
 from app.core.config import settings
 from app.core.database import Database
 from app.orchestration.brief import BriefStatus, confirm_brief, validate_work_items
+from app.runtime.runner import resolve_hermes_profile
 from app.runtime.runs import RunStatus, create_run, list_run_steps
 from app.services.workspace import (
     add_message,
@@ -74,18 +75,14 @@ def _brief_work_items(brief: dict, allowed_agent_ids: set[str]) -> list[dict]:
 def _ready_profiles(conn: Database, owner_ids: set[str]) -> dict[str, str]:
     if not owner_ids:
         return {}
-    placeholders = ",".join("?" for _ in owner_ids)
-    rows = conn.execute(
-        f"""SELECT agent_id, hermes_profile, status FROM agent_specs
-        WHERE agent_id IN ({placeholders})""",
-        tuple(owner_ids),
-    ).fetchall()
-    by_agent = {row["agent_id"]: row for row in rows}
     missing: list[str] = []
     profiles: dict[str, str] = {}
     for agent_id in owner_ids:
-        row = by_agent.get(agent_id)
-        if not row or row["status"] != "ready" or not row["hermes_profile"]:
+        profile = resolve_hermes_profile(conn, agent_id)
+        if not profile:
+            row = conn.execute(
+                "SELECT status FROM agent_specs WHERE agent_id = ?", (agent_id,)
+            ).fetchone()
             agent = conn.execute(
                 "SELECT name FROM agents WHERE id = ?", (agent_id,)
             ).fetchone()
@@ -93,7 +90,7 @@ def _ready_profiles(conn: Database, owner_ids: set[str]) -> dict[str, str]:
             status = row["status"] if row else "not_provisioned"
             missing.append(f"{name} ({status})")
         else:
-            profiles[agent_id] = row["hermes_profile"]
+            profiles[agent_id] = profile
     if missing:
         raise TaskPlanError("employees are not ready: " + ", ".join(missing))
     return profiles
@@ -257,7 +254,8 @@ def launch_brief(
             )
 
     conn.execute(
-        """UPDATE task_plans SET root_task_id = ?, status = 'active', updated_at = ?
+        """UPDATE task_plans SET root_task_id = ?, status = 'active',
+        workflow_status = 'active', updated_at = ?
         WHERE id = ?""",
         (root_task["id"], now_iso(), plan_id),
     )
@@ -425,11 +423,8 @@ def resume_task(
     ).fetchone()
     if active:
         raise TaskPlanError("task already has an active run")
-    spec = conn.execute(
-        """SELECT hermes_profile, status FROM agent_specs WHERE agent_id = ?""",
-        (task["owner_agent_id"],),
-    ).fetchone()
-    if not spec or spec["status"] != "ready" or not spec["hermes_profile"]:
+    profile = resolve_hermes_profile(conn, task["owner_agent_id"])
+    if not profile:
         raise TaskPlanError("task owner is not ready")
     last = conn.execute(
         "SELECT COALESCE(MAX(attempt_no), 0) AS attempt_no FROM runs WHERE task_id = ?",
@@ -445,17 +440,19 @@ def resume_task(
     enqueue_task_run(
         conn,
         task=task,
-        profile=spec["hermes_profile"],
+        profile=profile,
         attempt_no=int(last["attempt_no"]) + 1,
         input_message_id=input_message["id"],
     )
     conn.execute(
-        "UPDATE tasks SET status = '待执行', progress = 0, updated_at = ? WHERE id = ?",
+        """UPDATE tasks SET status = '待执行', workflow_status = 'ready',
+        waiting_reason = '', progress = 0, updated_at = ? WHERE id = ?""",
         (now_iso(), task_id),
     )
     if task["task_plan_id"]:
         conn.execute(
-            """UPDATE task_plans SET status = 'active', blocked_reason = '', updated_at = ?
+            """UPDATE task_plans SET status = 'active', workflow_status = 'active',
+            blocked_reason = '', updated_at = ?
             WHERE id = ?""",
             (now_iso(), task["task_plan_id"]),
         )

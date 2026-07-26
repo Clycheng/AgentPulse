@@ -100,7 +100,8 @@ def test_step1_no_auto_task(setup):
         headers=headers,
         json={"content": "帮我搞下周内容"},
     )
-    assert resp.status_code == 503
+    assert resp.status_code == 200
+    assert "尚未执行" in resp.json()["agent_message"]["content"]
 
     db = connect()
     try:

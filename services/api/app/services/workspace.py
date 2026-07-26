@@ -237,11 +237,10 @@ def _bootstrap_secretary_capabilities(
     """Ensure the built-in secretary has the complete capability catalogue.
 
     This is idempotent because it also repairs workspaces created before the
-    full default grant was introduced. In local/fallback mode we materialize
-    capability rows even without a Hermes profile, so the UI and function loop
-    do not incorrectly make the secretary look unconfigured. Credential-backed
-    capabilities remain ``credential_missing`` and approval/prohibited gates
-    are never relaxed here.
+    full default grant was introduced. We materialize capability rows before a
+    Hermes profile is ready so the UI can distinguish authorization from the
+    runtime state. Credential-backed capabilities remain
+    ``credential_missing`` and approval/prohibited gates are never relaxed.
     """
     from app.core.config import settings
     from app.orchestration.supply import create_agent_spec, ensure_agent_capability_rows
@@ -278,8 +277,8 @@ def _bootstrap_secretary_capabilities(
         capability_keys=SECRETARY_DEFAULT_CAPABILITIES,
     )
 
-    # No Hermes profile is needed for local DeepSeek/function-loop mode, but
-    # capability state must still be honest and useful to the UI.
+    # A profile may be supplied later by the Local Worker. Keep capability
+    # state honest while that runtime remains unavailable.
     if not settings.hermes_provisioning:
         now = now_iso()
         configured_credentials = {
@@ -363,6 +362,18 @@ def create_agent(
             now_iso(),
         ),
     )
+    try:
+        timestamp = now_iso()
+        conn.execute(
+            """INSERT INTO agent_work_states (
+              agent_id, workspace_id, presence, activity, state_since, updated_at
+            ) VALUES (?, ?, 'online', 'available', ?, ?)
+            ON CONFLICT (agent_id) DO NOTHING""",
+            (agent_id, workspace_id, timestamp, timestamp),
+        )
+    except Exception as exc:
+        if "no such table" not in str(exc):
+            raise
     return agent_id
 
 
@@ -555,6 +566,14 @@ def serialize_message(row: Row) -> dict:
 
 
 def serialize_task(row: Row, suggestion: dict | None = None) -> dict:
+    legacy_workflow_status = {
+        "待认领": "queued",
+        "待执行": "ready",
+        "进行中": "in_progress",
+        "待确认": "waiting_review",
+        "阻塞": "waiting_information",
+        "已完成": "completed",
+    }
     payload = {
         "id": row["id"],
         "title": row["title"],
@@ -573,6 +592,13 @@ def serialize_task(row: Row, suggestion: dict | None = None) -> dict:
         "plan_item_key": row.get("plan_item_key"),
         "expected_output": row.get("expected_output") or "",
         "output_type": row.get("output_type") or "markdown",
+        "workflow_status": row.get("workflow_status")
+        or legacy_workflow_status.get(row["status"], "queued"),
+        "waiting_reason": row.get("waiting_reason") or "",
+        "story_points": int(row.get("story_points") or 3),
+        "priority_score": float(row.get("priority_score") or 0),
+        "review_required": bool(row.get("review_required") or False),
+        "risk_level": row.get("risk_level") or "low",
         "created_at": row["created_at"],
         "updated_at": row["updated_at"],
     }
@@ -1096,6 +1122,22 @@ def create_task(
             created_at,
         ),
     )
+    workflow_status = {
+        "待认领": "queued",
+        "待执行": "ready",
+        "进行中": "in_progress",
+        "待确认": "waiting_review",
+        "阻塞": "waiting_information",
+        "已完成": "completed",
+    }.get(normalized_status, "queued")
+    try:
+        conn.execute(
+            "UPDATE tasks SET workflow_status = ? WHERE id = ?",
+            (workflow_status, task_id),
+        )
+    except Exception as exc:
+        if "no such column" not in str(exc):
+            raise
     add_task_event(
         conn,
         workspace_id=workspace_id,
@@ -1141,6 +1183,15 @@ def update_task(
     ).fetchone()
     if existing is None:
         raise ValueError("task not found")
+
+    requested_status = changes.get("status", existing["status"])
+    if (
+        existing["task_plan_id"]
+        and normalize_task_status(requested_status) in {"待确认", "已完成"}
+    ):
+        raise ValueError(
+            "planned task completion is controlled by verified scheduler output"
+        )
 
     next_values = {
         "title": changes.get("title", existing["title"]),
@@ -1701,7 +1752,9 @@ def provision_new_agent(
     source_request: str,
     responsibilities: list[str],
     capability_keys: list[str],
-) -> None:
+    provision_now: bool = False,
+    full_capability_spec: bool = False,
+) -> dict | None:
     """Give a freshly-created agent a real Hermes profile, not just a name tag.
 
     The shared "compile a role description into a real, working employee"
@@ -1712,18 +1765,20 @@ def provision_new_agent(
     into an actual provisioned Hermes profile, instead of each caller
     reimplementing the same dance.
 
-    Only runs when settings.hermes_provisioning is on
-    (build_provisioner_from_settings is a no-op RecordOnlyProvisioner
-    otherwise) — so the test suite's DeepSeek-fallback assumptions for
-    agents created without this flag aren't disturbed.
+    Most background recruitment paths only provision when server provisioning
+    is enabled and split credential-gated capabilities so usable work can
+    start immediately. The explicit employee form has historically provisioned
+    a submitted role specification immediately and shown every requested
+    capability, so it opts into ``provision_now`` + ``full_capability_spec``.
+    Both behaviours use this same entry point rather than route-local setup.
 
     Credential-needing capabilities remain visible as pending while the
     employee's credential-free capabilities receive a working profile.
     """
     from app.core.config import settings
 
-    if not settings.hermes_provisioning:
-        return
+    if not settings.hermes_provisioning and not provision_now:
+        return None
     from app.orchestration.supply import (
         ProvisioningError,
         build_provisioner_from_settings,
@@ -1741,7 +1796,7 @@ def provision_new_agent(
         if settings.model_byok_required and not has_workspace_model_credential(
             conn, workspace_id
         ):
-            create_agent_spec(
+            spec = create_agent_spec(
                 conn,
                 agent_id=agent_id,
                 workspace_id=workspace_id,
@@ -1755,7 +1810,7 @@ def provision_new_agent(
                 "WHERE agent_id = ?",
                 (now_iso(), agent_id),
             )
-            return
+            return {**spec, "status": "blocked_on_credentials"}
 
         ready_keys, pending_keys = split_by_credentials(capability_keys)
         provisioner = build_provisioner_from_settings()
@@ -1766,23 +1821,27 @@ def provision_new_agent(
             role_name=role_name,
             source_request=source_request,
             responsibilities=responsibilities,
-            capability_keys=ready_keys,
+            capability_keys=(capability_keys if full_capability_spec else ready_keys),
         )
-        provision(conn, agent_id, provisioner)
-        from app.runtime.upgrade import UpgradeError, execute_upgrade
+        spec = provision(conn, agent_id, provisioner)
+        if not full_capability_spec:
+            from app.runtime.upgrade import UpgradeError, execute_upgrade
 
-        for key in pending_keys:
-            try:
-                execute_upgrade(
-                    conn,
-                    approval={"agent_id": agent_id, "workspace_id": workspace_id},
-                    approved_capability_key=key,
-                    provisioner=provisioner,
-                )
-            except UpgradeError:
-                pass
+            for key in pending_keys:
+                try:
+                    execute_upgrade(
+                        conn,
+                        approval={"agent_id": agent_id, "workspace_id": workspace_id},
+                        approved_capability_key=key,
+                        provisioner=provisioner,
+                    )
+                except UpgradeError:
+                    pass
+        return spec
     except ProvisioningError:
-        pass  # non-fatal — the employee is still usable via the DeepSeek fallback
+        # Keep the employee record for retry/desktop provisioning. There is no
+        # direct-model fallback: any chat remains blocked until Hermes is ready.
+        return None
 
 
 def create_dm_conversation(

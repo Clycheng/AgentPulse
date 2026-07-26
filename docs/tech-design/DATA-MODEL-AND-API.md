@@ -438,7 +438,7 @@ def reload_gateway(self, profile_name: str) -> None:
 
 ### 10.3 调度与 API
 
-- worker 每 2 秒扫描；每 workspace 最多 2 个 running Run；租约 30 秒、10 秒续租。
+- worker 每 2 秒扫描；历史首版每 workspace 最多 2 个 running Run。该固定限制已被 ADR 0017/§13 的资源容量调度取代；租约 30 秒、10 秒续租不变。
 - 重启回收过期租约：原 Run 失败；常规自动执行最多 attempt 2，仍失败则计划阻塞。老板对阻塞任务调用 resume 后可建立下一 attempt。
 - 只有全部前置任务完成才创建后继 queued Run；全部子任务完成后根任务与计划自动完成。
 - RunStep 工具事件写入后立即提交事务，避免 SQLite 长写事务阻塞独立心跳与 MCP 请求。
@@ -512,3 +512,33 @@ def reload_gateway(self, profile_name: str) -> None:
 `/mcp/company-tools/` 另外提供 `list_colleagues / search_company_memory /
 ping_colleague / send_internal_message / propose_internal_task /
 record_observation / report_relationship_fact`。MCP 参数使用同事姓名和岗位语义，服务端再解析到内部员工记录；所有调用仍必须绑定任务 Run 和现有计划调整上限。
+
+## 13. TD-15 百人员工调度【代码闭环已实现】
+
+### 13.1 新表与扩列
+
+- `work_requests`：请求人/目标员工/来源消息与任务/brief、九态状态、Hermes triage Run、评分、转换 Task、抢占对象和时间戳。
+- `priority_assessments`：每次 Story Point 与业务价值、紧急度、解锁、风险、老化、切换成本和最终分数的不可变审计。
+- `agent_work_states`：presence、七态 activity、当前 Task/Run、请求数、队列深度和小时抢占窗口。
+- `resource_leases / task_resource_requirements`：服务端 Hermes、模型、本机文件/终端、浏览器上下文、computer use、项目写入和 Git worktree 的 shared/exclusive 需求与短租约。
+- `task_reviews`：原任务、评审人、独立评审 Task、决定和理由。
+- `coordination_cases`：争议请求、独立协调员工、Hermes coordination Run、证据和裁决。
+- `tasks` 增加 canonical workflow status、等待原因、Story Point、评分分量、抢占/检查点、评审与风险；`task_dependencies` 增加类型和证据；`runs` 增加 run kind、Hermes session、暂停/检查点/资源字段；`task_plans` 增加 canonical workflow status。
+
+### 13.2 状态真相与依赖
+
+`runs.status` 是唯一运行状态真相源；`runtime_status` 只在一个客户端兼容期由它同步派生，迁移和启动初始化会修复历史冲突。Task、Run、员工、请求和计划枚举见 [TD-15 §3](TD-15-workforce-scheduler.md)。硬产出依赖要求前置任务完成且存在匹配 `output_type` 的持久 `task_output`；信息依赖可由消息/事件证据满足，资源依赖由 Broker 领取。依赖环在写入时拒绝；失败分支使计划 `degraded`。
+
+### 13.3 API
+
+| 方法 | 路径 | 语义 |
+|---|---|---|
+| POST | `/api/work-requests` | 创建请求并立即返回 delivered，不冒充员工已读 |
+| GET | `/api/agents/{id}/workbench` | 当前工作、请求、优先队列、暂停项、依赖、资源 |
+| POST | `/api/work-requests/{id}/decision` | 仅绑定该请求的 Hermes triage Run |
+| POST | `/api/work-requests/{id}/disputes` | 建立独立协调 case |
+| POST | `/api/coordination-cases/{id}/decision` | 仅绑定 coordination Hermes Run |
+| POST | `/api/tasks/{id}/dependencies`、`/reviews` | 类型依赖与独立评审 |
+| POST | `/api/runs/{id}/pause`、`/resume` | 安全暂停与同 session 恢复 |
+| POST | `/api/local-devices/{id}/runs/claim` | 按设备资源原子批量领取 |
+| GET | `/api/workforce/overview`、`/events` | 公司运行总览与 workspace SSE |

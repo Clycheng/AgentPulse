@@ -19,7 +19,6 @@ from app.core.database import connect, init_db
 from app.main import app
 from app.orchestration.team_compiler import TeamDraftError, parse_team_draft
 from app.runtime.profile_provisioner import RecordOnlyProvisioner
-from app.schemas.run import LlmChatResponse
 
 
 # --------------------------------------------------------------- parse_team_draft
@@ -109,30 +108,27 @@ def _client(tmp_path, monkeypatch):
 def test_draft_team_endpoint_returns_parsed_members(tmp_path, monkeypatch):
     client, token = _client(tmp_path, monkeypatch)
 
-    async def fake_complete(self, request, *, system_prompt_override=None):
-        assert system_prompt_override is not None  # must not use the chat persona wrapper
-        return LlmChatResponse(
-            reply=json.dumps(
-                {
-                    "members": [
-                        {
-                            "name": "阿工",
-                            "role": "质检专员",
-                            "department": "质检部",
-                            "description": "核查打卡照片",
-                            "responsibilities": ["核查真实性"],
-                            "suggested_capability_keys": ["data_analysis"],
-                        }
-                    ]
-                },
-                ensure_ascii=False,
-            ),
-            provider="deepseek",
-            model="deepseek-v4-flash",
+    async def fake_hermes_control(_conn, **kwargs):
+        assert kwargs["purpose"] == "team-draft"
+        assert "团队需求" in kwargs["prompt"]
+        return json.dumps(
+            {
+                "members": [
+                    {
+                        "name": "阿工",
+                        "role": "质检专员",
+                        "department": "质检部",
+                        "description": "核查打卡照片",
+                        "responsibilities": ["核查真实性"],
+                        "suggested_capability_keys": ["data_analysis"],
+                    }
+                ]
+            },
+            ensure_ascii=False,
         )
 
     monkeypatch.setattr(
-        team_compiler_routes.DeepSeekChatClient, "complete", fake_complete
+        team_compiler_routes, "run_hermes_control", fake_hermes_control
     )
 
     resp = client.post(
@@ -150,11 +146,11 @@ def test_draft_team_endpoint_returns_parsed_members(tmp_path, monkeypatch):
 def test_draft_team_endpoint_422_on_unparseable_output(tmp_path, monkeypatch):
     client, token = _client(tmp_path, monkeypatch)
 
-    async def fake_complete(self, request, *, system_prompt_override=None):
-        return LlmChatResponse(reply="不是JSON", provider="deepseek", model="x")
+    async def fake_hermes_control(_conn, **_kwargs):
+        return "不是JSON"
 
     monkeypatch.setattr(
-        team_compiler_routes.DeepSeekChatClient, "complete", fake_complete
+        team_compiler_routes, "run_hermes_control", fake_hermes_control
     )
     resp = client.post(
         "/api/agents/draft-team",

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import secrets
 from datetime import UTC, datetime, timedelta
 from typing import Callable
@@ -11,14 +12,29 @@ from typing import Callable
 from app.core.config import settings
 from app.core.database import Database, connect
 from app.core.logging import get_logger
+from app.orchestration.workforce import (
+    claim_server_runs,
+    dependency_blockers,
+    refresh_plan_state,
+    schedule_coordination_work,
+    schedule_ready_tasks,
+    schedule_work_request_triage,
+    sync_agent_work_state,
+)
 from app.runtime.company_tools_auth import create_company_tool_token
 from app.runtime.hermes_client import HermesBackend, RunContext
-from app.runtime.runner import start_run
-from app.runtime.runs import RunStatus
+from app.runtime.runner import resolve_hermes_profile, start_run
+from app.runtime.runs import RunStatus, create_run
 from app.schemas.content_package import ContentPackageV1
 from app.services.content_packages import parse_content_package
 from app.services.task_plans import enqueue_task_run
 from app.services.workspace import add_task_event, add_task_output, now_iso
+from app.services.workforce import (
+    acquire_task_resources,
+    decide_coordination_case,
+    release_run_resources,
+    resume_preempted_task_after,
+)
 
 
 logger = get_logger(__name__)
@@ -48,6 +64,8 @@ class TaskScheduler:
         self._collect_finished()
         conn = connect()
         try:
+            self._enqueue_coordination_runs(conn)
+            self._enqueue_work_request_triage(conn)
             self._enqueue_ready_tasks(conn)
             claimed = self._claim_runs(conn)
             conn.commit()
@@ -68,50 +86,234 @@ class TaskScheduler:
                     pass
                 self._active.pop(run_id, None)
 
-    def _claim_runs(self, conn: Database) -> list[str]:
-        workspaces = conn.execute(
-            """SELECT DISTINCT workspace_id FROM runs
-            WHERE status = 'queued' AND (lease_expires_at IS NULL OR lease_expires_at < ?)
-            ORDER BY workspace_id""",
-            (now_iso(),),
+    def _enqueue_work_request_triage(self, conn: Database) -> None:
+        schedule_work_request_triage(
+            conn,
+            resolve_profile=resolve_hermes_profile,
+            create_special_run=self._create_special_run,
+            timestamp=now_iso(),
+        )
+
+    def _enqueue_coordination_runs(self, conn: Database) -> None:
+        schedule_coordination_work(
+            conn,
+            resolve_profile=resolve_hermes_profile,
+            create_special_run=self._create_special_run,
+            timestamp=now_iso(),
+        )
+
+    def _create_special_run(
+        self, conn: Database, item: dict, profile: str, run_kind: str
+    ) -> str:
+        agent_id = (
+            item["target_agent_id"]
+            if run_kind == "triage"
+            else item["coordinator_agent_id"]
+        )
+        run_id = create_run(
+            conn,
+            workspace_id=item["workspace_id"],
+            conversation_id=item["conversation_id"],
+            agent_id=agent_id,
+            task_id=None,
+            input_message_id=item.get("source_message_id"),
+            hermes_profile_id=profile,
+            workdir="",
+            status=RunStatus.QUEUED,
+            run_kind=run_kind,
+        )
+        work_root = os.path.abspath(settings.hermes_work_root or ".hermes-data")
+        workdir = os.path.join(work_root, profile, "work", run_kind, run_id)
+        conn.execute("UPDATE runs SET workdir = ? WHERE id = ?", (workdir, run_id))
+        return run_id
+
+    async def _execute_triage_run(self, conn: Database, run: dict) -> None:
+        request = conn.execute(
+            "SELECT * FROM work_requests WHERE triage_run_id = ?", (run["id"],)
+        ).fetchone()
+        if request is None:
+            raise ValueError("triage run has no work request")
+        queue = conn.execute(
+            """SELECT title, workflow_status, story_points, priority_score,
+            waiting_reason FROM tasks WHERE owner_agent_id = ?
+            AND workflow_status NOT IN ('completed','cancelled')
+            ORDER BY priority_score DESC, created_at LIMIT 20""",
+            (run["agent_id"],),
         ).fetchall()
-        claimed: list[str] = []
-        for workspace in workspaces:
-            workspace_id = workspace["workspace_id"]
-            occupied = conn.execute(
-                """SELECT COUNT(*) AS count FROM runs WHERE workspace_id = ? AND (
-                  status IN ('running','waiting_user','waiting_clarify') OR
-                  (status = 'queued' AND lease_expires_at >= ?)
-                )""",
-                (workspace_id, now_iso()),
-            ).fetchone()["count"]
-            slots = max(0, settings.task_workspace_concurrency - int(occupied))
-            if slots == 0:
-                continue
-            candidates = conn.execute(
-                """SELECT id FROM runs WHERE workspace_id = ? AND status = 'queued'
-                AND (lease_expires_at IS NULL OR lease_expires_at < ?)
-                ORDER BY created_at, id LIMIT ?""",
-                (workspace_id, now_iso(), slots),
-            ).fetchall()
-            for candidate in candidates:
-                conn.execute(
-                    """UPDATE runs SET lease_owner = ?, lease_expires_at = ?
-                    WHERE id = ? AND status = 'queued'
-                    AND (lease_expires_at IS NULL OR lease_expires_at < ?)""",
-                    (
-                        self.worker_id,
-                        _iso_after(settings.task_run_lease_seconds),
-                        candidate["id"],
-                        now_iso(),
-                    ),
+        token = create_company_tool_token(
+            workspace_id=run["workspace_id"],
+            run_id=run["id"],
+            agent_id=run["agent_id"],
+            conversation_id=run["conversation_id"],
+            run_kind="triage",
+        )
+        prompt = f"""你正在处理一条已经送达的内部工作请求。
+
+【请求 ID】{request['id']}
+【请求内容】{request['content']}
+【当前个人队列】{json.dumps([dict(row) for row in queue], ensure_ascii=False)}
+
+先判断这是可立即回答的问题，还是需要持续工作和交付物。
+- 快速确认：调用 decide_work_request，decision=answered。
+- 接受为正式任务：decision=accepted，并使用 1/2/3/5/8/13 Story Point。
+- 暂后处理：decision=deferred；无法执行：rejected；信息不足：needs_info。
+- 排序只看业务价值、紧急度、解锁同事、风险降低、等待时长和工作量，
+  不因请求人的身份加权。超过 13 SP 必须要求拆分。
+必须调用 decide_work_request 留下结构化决定，不能只输出自然语言。
+"""
+        ctx = RunContext(
+            run_id=run["id"],
+            prompt=prompt,
+            workdir=run["workdir"],
+            profile=run["hermes_profile_id"],
+            agent_id=run["agent_id"],
+            workspace_id=run["workspace_id"],
+            conversation_id=run["conversation_id"],
+            resume_session_id=run.get("hermes_session_id"),
+            mcp_servers=[
+                {
+                    "name": "agentpulse-company",
+                    "url": settings.company_tools_url,
+                    "headers": {"Authorization": f"Bearer {token}"},
+                }
+            ],
+        )
+        result = await start_run(
+            conn,
+            ctx=ctx,
+            backend=self.backend_factory(),
+            input_message_id=run.get("input_message_id"),
+            persist_message=False,
+            existing_run_id=run["id"],
+        )
+        latest_request = conn.execute(
+            "SELECT * FROM work_requests WHERE id = ?", (request["id"],)
+        ).fetchone()
+        if latest_request and latest_request["status"] == "evaluating":
+            response = result.get("text") or "本次评估未形成结构化决定，需要补充信息后重试。"
+            conn.execute(
+                """UPDATE work_requests SET status = 'needs_info', response_content = ?,
+                decision_reason = 'Hermes 未调用结构化决策工具', decided_at = ?,
+                updated_at = ? WHERE id = ?""",
+                (response[:4000], now_iso(), now_iso(), request["id"]),
+            )
+            if result.get("text"):
+                from app.services.workspace import add_message
+
+                add_message(
+                    conn,
+                    conversation_id=run["conversation_id"],
+                    sender_type="agent",
+                    sender_id=run["agent_id"],
+                    content=result["text"],
+                    provider="hermes",
+                    model="",
                 )
-                row = conn.execute(
-                    "SELECT lease_owner FROM runs WHERE id = ?", (candidate["id"],)
-                ).fetchone()
-                if row and row["lease_owner"] == self.worker_id:
-                    claimed.append(candidate["id"])
-        return claimed
+        conn.execute(
+            "UPDATE runs SET lease_owner = NULL, lease_expires_at = NULL WHERE id = ?",
+            (run["id"],),
+        )
+        sync_agent_work_state(conn, run["agent_id"], now_iso=now_iso())
+
+    async def _execute_coordination_run(self, conn: Database, run: dict) -> None:
+        case = conn.execute(
+            """SELECT c.*, w.content AS request_content, w.status AS request_status,
+            w.target_agent_id, w.requester_type, w.requester_id, w.consensus_brief_id
+            FROM coordination_cases c JOIN work_requests w ON w.id = c.work_request_id
+            WHERE c.run_id = ?""",
+            (run["id"],),
+        ).fetchone()
+        if case is None:
+            raise ValueError("coordination run has no case")
+        brief = None
+        if case.get("consensus_brief_id"):
+            brief = conn.execute(
+                "SELECT * FROM consensus_briefs WHERE id = ?",
+                (case["consensus_brief_id"],),
+            ).fetchone()
+        assessments = conn.execute(
+            """SELECT * FROM priority_assessments WHERE work_request_id = ?
+            ORDER BY created_at, id""",
+            (case["work_request_id"],),
+        ).fetchall()
+        token = create_company_tool_token(
+            workspace_id=run["workspace_id"],
+            run_id=run["id"],
+            agent_id=run["agent_id"],
+            conversation_id=run["conversation_id"],
+            run_kind="coordination",
+        )
+        prompt = f"""你是这次争议的独立协调员工，不代表请求方、执行方或老板。
+
+【协调 case】{case['id']}
+【争议原因】{case['reason']}
+【原请求】{case['request_content']}
+【原请求状态】{case['request_status']}
+【已确认目标】{json.dumps(dict(brief) if brief else None, ensure_ascii=False)}
+【排序证据】{json.dumps([dict(row) for row in assessments], ensure_ascii=False)}
+【补充证据 ID】{case['evidence_json']}
+
+只依据已确认目标、可审计证据和统一排序规则裁决，不因任何人的身份加权。
+- 请求应重新评估：uphold；合理延后：defer；不应执行：reject。
+- 只有目标本身不清楚时才用 needs_goal，请老板补充目标。
+必须调用 decide_coordination_case，不能只输出自然语言。
+"""
+        ctx = RunContext(
+            run_id=run["id"],
+            prompt=prompt,
+            workdir=run["workdir"],
+            profile=run["hermes_profile_id"],
+            agent_id=run["agent_id"],
+            workspace_id=run["workspace_id"],
+            conversation_id=run["conversation_id"],
+            resume_session_id=run.get("hermes_session_id"),
+            mcp_servers=[
+                {
+                    "name": "agentpulse-company",
+                    "url": settings.company_tools_url,
+                    "headers": {"Authorization": f"Bearer {token}"},
+                }
+            ],
+        )
+        result = await start_run(
+            conn,
+            ctx=ctx,
+            backend=self.backend_factory(),
+            input_message_id=None,
+            persist_message=False,
+            existing_run_id=run["id"],
+        )
+        latest = conn.execute(
+            "SELECT status FROM coordination_cases WHERE id = ?", (case["id"],)
+        ).fetchone()
+        if latest and latest["status"] == "evaluating":
+            decide_coordination_case(
+                conn,
+                workspace_id=run["workspace_id"],
+                case_id=case["id"],
+                coordinator_agent_id=run["agent_id"],
+                run_id=run["id"],
+                decision="needs_goal",
+                reason=result.get("text")
+                or "Hermes 未调用结构化协调工具，需要补充目标后重试。",
+            )
+        conn.execute(
+            "UPDATE runs SET lease_owner = NULL, lease_expires_at = NULL WHERE id = ?",
+            (run["id"],),
+        )
+        sync_agent_work_state(conn, run["agent_id"], now_iso=now_iso())
+
+    def _claim_runs(self, conn: Database) -> list[str]:
+        return claim_server_runs(
+            conn,
+            worker_id=self.worker_id,
+            configured_slots=settings.task_server_slots,
+            lease_seconds=settings.task_run_lease_seconds,
+            timestamp=now_iso(),
+            lease_expires_at=_iso_after(settings.task_run_lease_seconds),
+            acquire_resources=acquire_task_resources,
+            release_resources=release_run_resources,
+        )
 
     async def _execute_run(self, run_id: str) -> None:
         heartbeat = asyncio.create_task(self._heartbeat(run_id))
@@ -122,12 +324,20 @@ class TaskScheduler:
                 t.description AS task_description, t.expected_output,
                 t.output_type, t.plan_item_key, t.status AS task_status,
                 p.brief_id
-                FROM runs r JOIN tasks t ON t.id = r.task_id
-                JOIN task_plans p ON p.id = t.task_plan_id
+                FROM runs r LEFT JOIN tasks t ON t.id = r.task_id
+                LEFT JOIN task_plans p ON p.id = t.task_plan_id
                 WHERE r.id = ? AND r.lease_owner = ?""",
                 (run_id, self.worker_id),
             ).fetchone()
             if row is None:
+                return
+            if row.get("run_kind") == "triage":
+                await self._execute_triage_run(conn, row)
+                conn.commit()
+                return
+            if row.get("run_kind") == "coordination":
+                await self._execute_coordination_run(conn, row)
+                conn.commit()
                 return
             prompt = self._build_task_prompt(conn, row)
             workspace = conn.execute(
@@ -160,6 +370,7 @@ class TaskScheduler:
                 task_id=row["task_id"],
                 run_id=row["id"],
                 agent_id=row["agent_id"],
+                conversation_id=row["conversation_id"],
             )
             ctx = RunContext(
                 run_id=run_id,
@@ -171,6 +382,7 @@ class TaskScheduler:
                 conversation_id=row["conversation_id"],
                 task_id=row["task_id"],
                 context_manifest_id=context_manifest["id"] if context_manifest else None,
+                resume_session_id=row.get("hermes_session_id"),
                 mcp_servers=[
                     {
                         "name": "agentpulse-company",
@@ -180,7 +392,8 @@ class TaskScheduler:
                 ],
             )
             conn.execute(
-                "UPDATE tasks SET status = '进行中', progress = 10, updated_at = ? WHERE id = ?",
+                """UPDATE tasks SET status = '进行中', workflow_status = 'in_progress',
+                progress = 10, updated_at = ? WHERE id = ?""",
                 (now_iso(), row["task_id"]),
             )
             conn.commit()
@@ -210,7 +423,8 @@ class TaskScheduler:
                 conn.execute(
                     """UPDATE runs SET lease_expires_at = ?
                     WHERE id = ? AND lease_owner = ? AND status IN (
-                      'queued','running','waiting_user','waiting_clarify'
+                      'leased','running','pausing','waiting_user','waiting_clarify',
+                      'waiting_approval','waiting_information','waiting_colleague'
                     )""",
                     (
                         _iso_after(settings.task_run_lease_seconds),
@@ -297,19 +511,17 @@ class TaskScheduler:
             "UPDATE runs SET lease_owner = NULL, lease_expires_at = NULL WHERE id = ?",
             (run["id"],),
         )
+        release_run_resources(conn, run_id=run["id"])
+        if latest and latest["status"] == RunStatus.PAUSED:
+            sync_agent_work_state(conn, run["agent_id"], now_iso=now_iso())
+            return
         if task["status"] == "阻塞":
             return
         if not latest or latest["status"] != RunStatus.COMPLETED:
             self._retry_or_block(conn, run["task_id"], latest or run, latest["error"] if latest else "run failed")
             return
 
-        unmet = conn.execute(
-            """SELECT COUNT(*) AS count FROM task_dependencies d
-            JOIN tasks dependency ON dependency.id = d.depends_on_task_id
-            WHERE d.task_id = ? AND dependency.status <> '已完成'""",
-            (run["task_id"],),
-        ).fetchone()["count"]
-        if int(unmet):
+        if dependency_blockers(conn, run["task_id"]):
             conn.execute(
                 "UPDATE tasks SET status = '待执行', progress = 0, updated_at = ? WHERE id = ?",
                 (now_iso(), run["task_id"]),
@@ -336,7 +548,8 @@ class TaskScheduler:
             invalid_reason = "required output was not submitted"
         if not matching:
             conn.execute(
-                """UPDATE runs SET status = 'failed', error = ?, completed_at = ?
+                """UPDATE runs SET status = 'failed', runtime_status = 'failed',
+                error = ?, completed_at = ?
                 WHERE id = ?""",
                 (invalid_reason, now_iso(), run["id"]),
             )
@@ -347,7 +560,8 @@ class TaskScheduler:
             return
 
         conn.execute(
-            "UPDATE tasks SET status = '已完成', progress = 100, updated_at = ? WHERE id = ?",
+            """UPDATE tasks SET status = '已完成', workflow_status = 'completed',
+            waiting_reason = '', progress = 100, updated_at = ? WHERE id = ?""",
             (now_iso(), run["task_id"]),
         )
         add_task_event(
@@ -360,8 +574,10 @@ class TaskScheduler:
             title="任务自动完成",
             content=run["expected_output"],
         )
+        resume_preempted_task_after(conn, task_id=run["task_id"])
         self._enqueue_ready_tasks(conn, plan_id=run["task_plan_id"])
         self._refresh_plan(conn, run["task_plan_id"])
+        sync_agent_work_state(conn, run["agent_id"], now_iso=now_iso())
 
     def _save_markdown_fallback(self, conn: Database, run: dict, text: str) -> None:
         add_task_output(
@@ -381,19 +597,17 @@ class TaskScheduler:
         task = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
         attempt = int(run["attempt_no"])
         if attempt < 2:
-            spec = conn.execute(
-                "SELECT hermes_profile, status FROM agent_specs WHERE agent_id = ?",
-                (task["owner_agent_id"],),
-            ).fetchone()
-            if spec and spec["status"] == "ready" and spec["hermes_profile"]:
+            profile = resolve_hermes_profile(conn, task["owner_agent_id"])
+            if profile:
                 enqueue_task_run(
                     conn,
                     task=task,
-                    profile=spec["hermes_profile"],
+                    profile=profile,
                     attempt_no=attempt + 1,
                 )
                 conn.execute(
-                    "UPDATE tasks SET status = '待执行', progress = 0, updated_at = ? WHERE id = ?",
+                    """UPDATE tasks SET status = '待执行', workflow_status = 'ready',
+                    progress = 0, updated_at = ? WHERE id = ?""",
                     (now_iso(), task_id),
                 )
                 return
@@ -401,11 +615,13 @@ class TaskScheduler:
 
     def _block_after_failure(self, conn: Database, task: dict, reason: str) -> None:
         conn.execute(
-            "UPDATE tasks SET status = '阻塞', updated_at = ? WHERE id = ?",
+            """UPDATE tasks SET status = '阻塞', workflow_status = 'waiting_information',
+            waiting_reason = 'execution_failed', updated_at = ? WHERE id = ?""",
             (now_iso(), task["id"]),
         )
         conn.execute(
-            """UPDATE task_plans SET status = 'blocked', blocked_reason = ?, updated_at = ?
+            """UPDATE task_plans SET status = 'blocked', workflow_status = 'degraded',
+            blocked_reason = ?, updated_at = ?
             WHERE id = ?""",
             (reason[:2000], now_iso(), task["task_plan_id"]),
         )
@@ -419,99 +635,46 @@ class TaskScheduler:
             title="自动执行两次失败",
             content=reason[:2000],
         )
+        resume_preempted_task_after(conn, task_id=task["id"])
 
     def _enqueue_ready_tasks(
         self, conn: Database, *, plan_id: str | None = None
     ) -> None:
-        params: tuple = () if plan_id is None else (plan_id,)
-        filter_sql = "" if plan_id is None else "AND t.task_plan_id = ?"
-        tasks = conn.execute(
-            f"""SELECT t.* FROM tasks t JOIN task_plans p ON p.id = t.task_plan_id
-            WHERE t.status = '待执行' AND t.plan_item_key <> '__root__'
-            AND p.status IN ('active','blocked') {filter_sql}
-            ORDER BY t.created_at, t.id""",
-            params,
-        ).fetchall()
-        for task in tasks:
-            active = conn.execute(
-                """SELECT id FROM runs WHERE task_id = ? AND status IN (
-                  'queued','running','waiting_user','waiting_clarify'
-                ) LIMIT 1""",
-                (task["id"],),
-            ).fetchone()
-            if active:
-                continue
-            unmet = conn.execute(
-                """SELECT COUNT(*) AS count FROM task_dependencies d
-                JOIN tasks dependency ON dependency.id = d.depends_on_task_id
-                WHERE d.task_id = ? AND dependency.status <> '已完成'""",
-                (task["id"],),
-            ).fetchone()["count"]
-            if int(unmet):
-                continue
-            spec = conn.execute(
-                "SELECT hermes_profile, status FROM agent_specs WHERE agent_id = ?",
-                (task["owner_agent_id"],),
-            ).fetchone()
-            if not spec or spec["status"] != "ready" or not spec["hermes_profile"]:
-                self._block_after_failure(conn, task, "task owner is not ready")
-                continue
-            latest = conn.execute(
-                "SELECT COALESCE(MAX(attempt_no), 0) AS attempt FROM runs WHERE task_id = ?",
-                (task["id"],),
-            ).fetchone()
-            enqueue_task_run(
-                conn,
-                task=task,
-                profile=spec["hermes_profile"],
-                attempt_no=int(latest["attempt"]) + 1,
-            )
+        schedule_ready_tasks(
+            conn,
+            resolve_profile=resolve_hermes_profile,
+            enqueue_run=lambda db, task, profile, attempt: enqueue_task_run(
+                db, task=task, profile=profile, attempt_no=attempt
+            ),
+            block_unready=self._block_after_failure,
+            timestamp=now_iso(),
+            plan_id=plan_id,
+        )
 
     def _refresh_plan(self, conn: Database, plan_id: str) -> None:
-        plan = conn.execute("SELECT * FROM task_plans WHERE id = ?", (plan_id,)).fetchone()
-        children = conn.execute(
-            """SELECT status, progress FROM tasks
-            WHERE task_plan_id = ? AND plan_item_key <> '__root__'""",
-            (plan_id,),
-        ).fetchall()
-        if not children:
-            return
-        progress = sum(int(row["progress"]) for row in children) // len(children)
-        all_done = all(row["status"] == "已完成" for row in children)
-        blocked = any(row["status"] == "阻塞" for row in children)
-        root_status = "已完成" if all_done else "阻塞" if blocked else "进行中"
-        conn.execute(
-            "UPDATE tasks SET status = ?, progress = ?, updated_at = ? WHERE id = ?",
-            (root_status, 100 if all_done else progress, now_iso(), plan["root_task_id"]),
-        )
-        if all_done:
-            conn.execute(
-                """UPDATE task_plans SET status = 'completed', completed_at = ?,
-                updated_at = ?, blocked_reason = '' WHERE id = ?""",
-                (now_iso(), now_iso(), plan_id),
-            )
-        elif not blocked:
-            conn.execute(
-                """UPDATE task_plans SET status = 'active', blocked_reason = '',
-                updated_at = ? WHERE id = ?""",
-                (now_iso(), plan_id),
-            )
+        refresh_plan_state(conn, plan_id=plan_id, timestamp=now_iso())
 
     async def recover_expired_runs(self) -> None:
         conn = connect()
         try:
             rows = conn.execute(
-                """SELECT * FROM runs WHERE status IN ('running','waiting_user','waiting_clarify')
+                """SELECT * FROM runs WHERE status IN (
+                  'leased','running','pausing','waiting_user','waiting_clarify',
+                  'waiting_approval','waiting_information','waiting_colleague'
+                )
                 AND lease_expires_at IS NOT NULL AND lease_expires_at < ?""",
                 (now_iso(),),
             ).fetchall()
             for run in rows:
                 conn.execute(
-                    """UPDATE runs SET status = 'failed', error = 'worker lease expired',
+                    """UPDATE runs SET status = 'failed', runtime_status = 'failed',
+                    error = 'worker lease expired',
                     completed_at = ?, lease_owner = NULL, lease_expires_at = NULL WHERE id = ?""",
                     (now_iso(), run["id"]),
                 )
-                self._retry_or_block(conn, run["task_id"], run, "worker lease expired")
+                release_run_resources(conn, run_id=run["id"])
+                if run.get("task_id"):
+                    self._retry_or_block(conn, run["task_id"], run, "worker lease expired")
             conn.commit()
         except Exception:
             conn.rollback()
@@ -523,13 +686,38 @@ class TaskScheduler:
         conn = connect()
         try:
             run = conn.execute("SELECT * FROM runs WHERE id = ?", (run_id,)).fetchone()
-            if run and run["status"] not in ("completed", "failed"):
+            if run and run["status"] not in RunStatus.TERMINAL:
                 conn.execute(
-                    """UPDATE runs SET status = 'failed', error = ?, completed_at = ?,
+                    """UPDATE runs SET status = 'failed', runtime_status = 'failed',
+                    error = ?, completed_at = ?,
                     lease_owner = NULL, lease_expires_at = NULL WHERE id = ?""",
                     (error[:2000], now_iso(), run_id),
                 )
-                self._retry_or_block(conn, run["task_id"], run, error)
+                release_run_resources(conn, run_id=run_id)
+                if run.get("task_id"):
+                    self._retry_or_block(conn, run["task_id"], run, error)
+                elif run.get("run_kind") == "coordination":
+                    conn.execute(
+                        """UPDATE coordination_cases SET status = 'needs_goal',
+                        decision_reason = ?, updated_at = ?
+                        WHERE run_id = ? AND status = 'evaluating'""",
+                        (error[:2000], now_iso(), run_id),
+                    )
+                elif run.get("run_kind") == "triage":
+                    conn.execute(
+                        """UPDATE work_requests SET status = 'needs_info',
+                        decision_reason = ?, updated_at = ?
+                        WHERE triage_run_id = ? AND status = 'evaluating'""",
+                        (error[:2000], now_iso(), run_id),
+                    )
+                else:
+                    conn.execute(
+                        """UPDATE work_requests SET status = 'needs_info',
+                        response_content = ?, updated_at = ? WHERE triage_run_id = ?
+                        AND status = 'evaluating'""",
+                        (error[:2000], now_iso(), run_id),
+                    )
+                sync_agent_work_state(conn, run["agent_id"], now_iso=now_iso())
                 conn.commit()
         finally:
             conn.close()

@@ -1,9 +1,4 @@
-"""Tests for durable approval suspend/resume + clarification.
-
-The legacy in-process bridge remains covered as an isolated compatibility helper.
-Production RunService recovery is database-backed so a decision from another API
-connection, or after process-local state is lost, resumes the waiting ACP call.
-"""
+"""Tests for durable approval suspend/resume + clarification."""
 
 import asyncio
 
@@ -13,7 +8,6 @@ from fastapi.testclient import TestClient
 from app.core.config import settings
 from app.core.database import connect, init_db
 from app.main import app
-from app.runtime import approval_bridge
 from app.runtime.hermes_client import AgentEvent, RunContext
 from app.runtime.runner import make_bridge_resolver, stream_agent_run
 from app.runtime.runs import RunStatus, create_run, get_run
@@ -24,41 +18,6 @@ from app.services.workspace import (
     new_id,
     now_iso,
 )
-
-
-# ------------------------------------------------------------------ bridge unit
-
-
-def test_bridge_await_and_resolve():
-    async def scenario():
-        aid = "appr_x"
-        waiter = asyncio.create_task(approval_bridge.await_decision(aid))
-        for _ in range(100):
-            if approval_bridge.has_pending(aid):
-                break
-            await asyncio.sleep(0.005)
-        assert approval_bridge.has_pending(aid)
-        assert approval_bridge.resolve_pending(aid, "allow_once") is True
-        assert await waiter == "allow_once"
-        assert not approval_bridge.has_pending(aid)  # discarded
-
-    asyncio.run(scenario())
-
-
-def test_bridge_resolve_unknown_returns_false():
-    assert approval_bridge.resolve_pending("nope", "allow_once") is False
-
-
-def test_bridge_await_decision_expires_when_unanswered():
-    """ADR 0008 item 4: bounded wait — resolves to 'expired', not a hang."""
-
-    async def scenario():
-        aid = "appr_timeout"
-        result = await approval_bridge.await_decision(aid, timeout=0.05)
-        assert result == "expired"
-        assert not approval_bridge.has_pending(aid)  # discarded, not left dangling
-
-    asyncio.run(scenario())
 
 
 # ------------------------------------------------------------------ db helpers

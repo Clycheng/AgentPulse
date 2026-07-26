@@ -35,7 +35,8 @@ class Result:
 # ---------------------------------------------------------------------------
 # Placeholder translation — replaces `?` with the dialect-native placeholder
 # but *not* inside single-quoted strings (avoids breaking string literals
-# that happen to contain a literal ? character).
+# that happen to contain a literal ? character). PostgreSQL's driver also
+# treats every `%` as pyformat syntax, so source SQL literals must be escaped.
 # ---------------------------------------------------------------------------
 
 def _translate_placeholders(sql: str, dialect: str) -> str:
@@ -52,6 +53,8 @@ def _translate_placeholders(sql: str, dialect: str) -> str:
         if ch == "'":
             in_string = not in_string
             result.append(ch)
+        elif ch == "%":
+            result.append("%%")
         elif ch == "?" and not in_string:
             result.append("%s")
         else:
@@ -656,6 +659,9 @@ def init_postgres(conn: Database) -> None:
     ensure_column(conn, "runs", "lease_owner", "TEXT")
     ensure_column(conn, "runs", "lease_expires_at", "TEXT")
     ensure_column(conn, "runs", "started_at", "TEXT")
+    # Existing PostgreSQL deployments may predate TD-13. Create the referenced
+    # table before adding the foreign-key column to runs.
+    _init_td13_tables(conn)
     ensure_column(conn, "runs", "context_manifest_id", "TEXT REFERENCES context_manifests(id) ON DELETE SET NULL")
     ensure_column(conn, "approvals", "run_id", "TEXT REFERENCES runs(id) ON DELETE SET NULL")
     ensure_column(
@@ -701,8 +707,7 @@ def init_postgres(conn: Database) -> None:
     ensure_column(
         conn, "departments", "parent_id", "TEXT REFERENCES departments(id) ON DELETE CASCADE"
     )
-    if conn.dialect == "postgres":
-        conn.execute("ALTER TABLE runs ALTER COLUMN input_message_id DROP NOT NULL")
+    _upgrade_runs_input_message_nullable(conn)
     conn.execute(
         "CREATE UNIQUE INDEX IF NOT EXISTS ux_runs_task_attempt "
         "ON runs(task_id, attempt_no) WHERE task_id IS NOT NULL"
@@ -717,8 +722,8 @@ def init_postgres(conn: Database) -> None:
         "ON business_actions(dedupe_key) WHERE status IN "
         "('pending_approval','approved','executing','succeeded')"
     )
-    _init_td13_tables(conn)
     _init_td14_tables(conn)
+    _init_td15_tables(conn)
 
 
 def init_sqlite(conn: Database) -> None:
@@ -1171,6 +1176,7 @@ def init_sqlite(conn: Database) -> None:
     ensure_column(conn, "runs", "lease_owner", "TEXT")
     ensure_column(conn, "runs", "lease_expires_at", "TEXT")
     ensure_column(conn, "runs", "started_at", "TEXT")
+    _init_td13_tables(conn)
     ensure_column(conn, "runs", "context_manifest_id", "TEXT REFERENCES context_manifests(id) ON DELETE SET NULL")
     ensure_column(conn, "approvals", "run_id", "TEXT REFERENCES runs(id) ON DELETE SET NULL")
     ensure_column(
@@ -1216,6 +1222,7 @@ def init_sqlite(conn: Database) -> None:
     ensure_column(
         conn, "departments", "parent_id", "TEXT REFERENCES departments(id) ON DELETE CASCADE"
     )
+    _upgrade_runs_input_message_nullable(conn)
     conn.execute(
         "CREATE UNIQUE INDEX IF NOT EXISTS ux_runs_task_attempt "
         "ON runs(task_id, attempt_no) WHERE task_id IS NOT NULL"
@@ -1230,8 +1237,8 @@ def init_sqlite(conn: Database) -> None:
         "ON business_actions(dedupe_key) WHERE status IN "
         "('pending_approval','approved','executing','succeeded')"
     )
-    _init_td13_tables(conn)
     _init_td14_tables(conn)
+    _init_td15_tables(conn)
 
 
 def _init_td14_tables(conn: Database) -> None:
@@ -1297,10 +1304,25 @@ def _init_td14_tables(conn: Database) -> None:
         )
         """
     )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS local_profile_syncs (
+          device_id TEXT NOT NULL,
+          workspace_id TEXT NOT NULL,
+          agent_id TEXT NOT NULL,
+          profile_name TEXT NOT NULL,
+          manifest_hash TEXT NOT NULL,
+          status TEXT NOT NULL CHECK(status IN ('ready','failed')),
+          error TEXT NOT NULL DEFAULT '',
+          synced_at TEXT NOT NULL,
+          PRIMARY KEY(device_id, agent_id)
+        )
+        """
+    )
     ensure_column(conn, "runs", "execution_target", "TEXT NOT NULL DEFAULT 'server'")
     ensure_column(conn, "runs", "device_id", "TEXT")
     ensure_column(conn, "runs", "local_project_id", "TEXT")
-    ensure_column(conn, "runs", "runtime_status", "TEXT NOT NULL DEFAULT 'server'")
+    ensure_column(conn, "runs", "runtime_status", "TEXT NOT NULL DEFAULT 'queued'")
     ensure_column(conn, "runs", "execution_receipt_id", "TEXT")
     ensure_column(conn, "runs", "last_event_id", "INTEGER NOT NULL DEFAULT 0")
     ensure_column(conn, "runs", "prompt_text", "TEXT NOT NULL DEFAULT ''")
@@ -1315,6 +1337,273 @@ def _init_td14_tables(conn: Database) -> None:
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_local_projects_workspace "
         "ON local_projects(workspace_id, active)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_local_profile_syncs_workspace "
+        "ON local_profile_syncs(workspace_id, device_id, status)"
+    )
+
+
+def _init_td15_tables(conn: Database) -> None:
+    """TD-15 durable work queues, priority decisions and resource leases.
+
+    The legacy task/plan status columns remain readable for one desktop release.
+    New orchestration uses the additive workflow columns so existing databases
+    can upgrade in place without rewriting task history during startup.
+    """
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS work_requests (
+          id TEXT PRIMARY KEY,
+          workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+          conversation_id TEXT REFERENCES conversations(id) ON DELETE SET NULL,
+          source_message_id TEXT REFERENCES messages(id) ON DELETE SET NULL,
+          requester_type TEXT NOT NULL CHECK(requester_type IN ('user','agent','system')),
+          requester_id TEXT NOT NULL DEFAULT '',
+          target_agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+          source_task_id TEXT REFERENCES tasks(id) ON DELETE SET NULL,
+          consensus_brief_id TEXT REFERENCES consensus_briefs(id) ON DELETE SET NULL,
+          status TEXT NOT NULL DEFAULT 'delivered' CHECK(status IN (
+            'delivered','acknowledged','evaluating','answered','accepted',
+            'deferred','rejected','needs_info','withdrawn'
+          )),
+          content TEXT NOT NULL,
+          response_content TEXT NOT NULL DEFAULT '',
+          decision_reason TEXT NOT NULL DEFAULT '',
+          story_points INTEGER CHECK(story_points IN (1,2,3,5,8,13)),
+          business_value INTEGER NOT NULL DEFAULT 3 CHECK(business_value BETWEEN 0 AND 5),
+          urgency INTEGER NOT NULL DEFAULT 2 CHECK(urgency BETWEEN 0 AND 5),
+          unblock_score INTEGER NOT NULL DEFAULT 0 CHECK(unblock_score BETWEEN 0 AND 5),
+          risk_reduction INTEGER NOT NULL DEFAULT 0 CHECK(risk_reduction BETWEEN 0 AND 5),
+          switching_cost REAL NOT NULL DEFAULT 0,
+          priority_score REAL NOT NULL DEFAULT 0,
+          converted_task_id TEXT REFERENCES tasks(id) ON DELETE SET NULL,
+          triage_run_id TEXT REFERENCES runs(id) ON DELETE SET NULL,
+          preempts_task_id TEXT REFERENCES tasks(id) ON DELETE SET NULL,
+          created_at TEXT NOT NULL,
+          acknowledged_at TEXT,
+          decided_at TEXT,
+          updated_at TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS priority_assessments (
+          id TEXT PRIMARY KEY,
+          workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+          work_request_id TEXT REFERENCES work_requests(id) ON DELETE CASCADE,
+          task_id TEXT REFERENCES tasks(id) ON DELETE CASCADE,
+          agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+          story_points INTEGER NOT NULL CHECK(story_points IN (1,2,3,5,8,13)),
+          business_value INTEGER NOT NULL CHECK(business_value BETWEEN 0 AND 5),
+          urgency INTEGER NOT NULL CHECK(urgency BETWEEN 0 AND 5),
+          unblock_score INTEGER NOT NULL CHECK(unblock_score BETWEEN 0 AND 5),
+          risk_reduction INTEGER NOT NULL CHECK(risk_reduction BETWEEN 0 AND 5),
+          age_bonus REAL NOT NULL DEFAULT 0,
+          switching_cost REAL NOT NULL DEFAULT 0,
+          priority_score REAL NOT NULL,
+          reason TEXT NOT NULL DEFAULT '',
+          created_at TEXT NOT NULL,
+          CHECK(work_request_id IS NOT NULL OR task_id IS NOT NULL)
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS agent_work_states (
+          agent_id TEXT PRIMARY KEY REFERENCES agents(id) ON DELETE CASCADE,
+          workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+          presence TEXT NOT NULL DEFAULT 'online' CHECK(presence IN ('offline','online','degraded')),
+          activity TEXT NOT NULL DEFAULT 'available' CHECK(activity IN (
+            'available','triaging','focused','waiting','blocked','degraded'
+          )),
+          current_task_id TEXT REFERENCES tasks(id) ON DELETE SET NULL,
+          current_run_id TEXT REFERENCES runs(id) ON DELETE SET NULL,
+          pending_request_count INTEGER NOT NULL DEFAULT 0,
+          queue_depth INTEGER NOT NULL DEFAULT 0,
+          interruption_count_window INTEGER NOT NULL DEFAULT 0,
+          interruption_window_started_at TEXT,
+          state_since TEXT NOT NULL,
+          updated_at TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS resource_leases (
+          id TEXT PRIMARY KEY,
+          workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+          resource_type TEXT NOT NULL CHECK(resource_type IN (
+            'server_hermes','model','local_file','local_terminal','browser_context',
+            'computer_use','project_write','git_worktree'
+          )),
+          resource_key TEXT NOT NULL,
+          mode TEXT NOT NULL DEFAULT 'exclusive' CHECK(mode IN ('shared','exclusive')),
+          owner_agent_id TEXT REFERENCES agents(id) ON DELETE SET NULL,
+          run_id TEXT REFERENCES runs(id) ON DELETE CASCADE,
+          lease_owner TEXT NOT NULL,
+          status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active','released','expired')),
+          expires_at TEXT NOT NULL,
+          created_at TEXT NOT NULL,
+          released_at TEXT
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS task_resource_requirements (
+          id TEXT PRIMARY KEY,
+          workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+          task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+          resource_type TEXT NOT NULL CHECK(resource_type IN (
+            'server_hermes','model','local_file','local_terminal','browser_context',
+            'computer_use','project_write','git_worktree'
+          )),
+          resource_key TEXT NOT NULL,
+          mode TEXT NOT NULL DEFAULT 'exclusive' CHECK(mode IN ('shared','exclusive')),
+          units INTEGER NOT NULL DEFAULT 1 CHECK(units > 0),
+          created_at TEXT NOT NULL,
+          UNIQUE(task_id, resource_type, resource_key)
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS task_reviews (
+          id TEXT PRIMARY KEY,
+          workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+          task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+          reviewer_agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+          review_task_id TEXT REFERENCES tasks(id) ON DELETE SET NULL,
+          status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN (
+            'pending','in_review','approved','changes_requested','cancelled'
+          )),
+          instructions TEXT NOT NULL DEFAULT '',
+          decision_reason TEXT NOT NULL DEFAULT '',
+          created_at TEXT NOT NULL,
+          decided_at TEXT
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS coordination_cases (
+          id TEXT PRIMARY KEY,
+          workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+          work_request_id TEXT NOT NULL REFERENCES work_requests(id) ON DELETE CASCADE,
+          raised_by_type TEXT NOT NULL CHECK(raised_by_type IN ('user','agent','system')),
+          raised_by_id TEXT NOT NULL DEFAULT '',
+          coordinator_agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+          status TEXT NOT NULL DEFAULT 'queued' CHECK(status IN (
+            'queued','evaluating','resolved','needs_goal','cancelled'
+          )),
+          reason TEXT NOT NULL,
+          evidence_json TEXT NOT NULL DEFAULT '[]',
+          run_id TEXT REFERENCES runs(id) ON DELETE SET NULL,
+          decision TEXT NOT NULL DEFAULT '',
+          decision_reason TEXT NOT NULL DEFAULT '',
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL,
+          resolved_at TEXT
+        )
+        """
+    )
+    ensure_column(conn, "tasks", "workflow_status", "TEXT NOT NULL DEFAULT ''")
+    ensure_column(conn, "tasks", "waiting_reason", "TEXT NOT NULL DEFAULT ''")
+    ensure_column(conn, "tasks", "story_points", "INTEGER NOT NULL DEFAULT 3")
+    ensure_column(conn, "tasks", "business_value", "INTEGER NOT NULL DEFAULT 3")
+    ensure_column(conn, "tasks", "urgency", "INTEGER NOT NULL DEFAULT 2")
+    ensure_column(conn, "tasks", "unblock_score", "INTEGER NOT NULL DEFAULT 0")
+    ensure_column(conn, "tasks", "risk_reduction", "INTEGER NOT NULL DEFAULT 0")
+    ensure_column(conn, "tasks", "switching_cost", "REAL NOT NULL DEFAULT 0")
+    ensure_column(conn, "tasks", "priority_score", "REAL NOT NULL DEFAULT 0")
+    ensure_column(conn, "tasks", "preemptible", "INTEGER NOT NULL DEFAULT 1")
+    ensure_column(conn, "tasks", "preemption_count", "INTEGER NOT NULL DEFAULT 0")
+    ensure_column(conn, "tasks", "preempted_task_id", "TEXT")
+    ensure_column(conn, "tasks", "checkpoint_json", "TEXT NOT NULL DEFAULT '{}'")
+    ensure_column(conn, "tasks", "review_required", "INTEGER NOT NULL DEFAULT 0")
+    ensure_column(conn, "tasks", "risk_level", "TEXT NOT NULL DEFAULT 'low'")
+    ensure_column(conn, "task_dependencies", "dependency_type", "TEXT NOT NULL DEFAULT 'hard_output'")
+    ensure_column(conn, "task_dependencies", "status", "TEXT NOT NULL DEFAULT 'pending'")
+    ensure_column(conn, "task_dependencies", "satisfied_by_type", "TEXT NOT NULL DEFAULT ''")
+    ensure_column(conn, "task_dependencies", "satisfied_by_id", "TEXT")
+    ensure_column(conn, "task_dependencies", "satisfied_at", "TEXT")
+    ensure_column(conn, "task_plans", "workflow_status", "TEXT NOT NULL DEFAULT ''")
+    ensure_column(conn, "runs", "run_kind", "TEXT NOT NULL DEFAULT ''")
+    ensure_column(conn, "runs", "hermes_session_id", "TEXT")
+    ensure_column(conn, "runs", "pause_requested_at", "TEXT")
+    ensure_column(conn, "runs", "pause_reason", "TEXT NOT NULL DEFAULT ''")
+    ensure_column(conn, "runs", "checkpoint_json", "TEXT NOT NULL DEFAULT '{}'")
+    ensure_column(conn, "runs", "resource_requirements_json", "TEXT NOT NULL DEFAULT '[]'")
+    ensure_column(conn, "runs", "preempted_by_request_id", "TEXT")
+    ensure_column(conn, "runs", "resume_of_run_id", "TEXT")
+
+    conn.execute(
+        """UPDATE tasks SET workflow_status = CASE status
+          WHEN '待认领' THEN 'queued'
+          WHEN '待执行' THEN 'ready'
+          WHEN '进行中' THEN 'in_progress'
+          WHEN '待确认' THEN 'waiting_review'
+          WHEN '阻塞' THEN 'waiting_information'
+          WHEN '已完成' THEN 'completed'
+          ELSE 'queued' END
+        WHERE workflow_status = ''"""
+    )
+    conn.execute(
+        """UPDATE task_plans SET workflow_status = CASE status
+          WHEN 'launching' THEN 'launching'
+          WHEN 'active' THEN 'active'
+          WHEN 'blocked' THEN 'blocked'
+          WHEN 'completed' THEN 'completed'
+          WHEN 'cancelled' THEN 'cancelled'
+          ELSE 'active' END
+        WHERE workflow_status = ''"""
+    )
+    conn.execute(
+        """UPDATE runs SET run_kind = CASE WHEN task_id IS NULL THEN 'chat' ELSE 'task' END
+        WHERE run_kind = ''"""
+    )
+    if conn.dialect == "sqlite":
+        conn.execute(
+            """INSERT OR IGNORE INTO agent_work_states (
+              agent_id, workspace_id, presence, activity, state_since, updated_at
+            ) SELECT id, workspace_id, 'online', 'available', created_at, created_at
+            FROM agents"""
+        )
+    else:
+        conn.execute(
+            """INSERT INTO agent_work_states (
+              agent_id, workspace_id, presence, activity, state_since, updated_at
+            ) SELECT id, workspace_id, 'online', 'available', created_at, created_at
+            FROM agents ON CONFLICT (agent_id) DO NOTHING"""
+        )
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS ux_work_requests_message_target "
+        "ON work_requests(source_message_id, target_agent_id) WHERE source_message_id IS NOT NULL"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_work_requests_agent_status "
+        "ON work_requests(target_agent_id, status, created_at)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_tasks_agent_workflow "
+        "ON tasks(owner_agent_id, workflow_status, priority_score, created_at)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_resource_leases_lookup "
+        "ON resource_leases(workspace_id, resource_type, resource_key, status, expires_at)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_task_reviews_reviewer "
+        "ON task_reviews(reviewer_agent_id, status, created_at)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_coordination_cases_status "
+        "ON coordination_cases(workspace_id, status, created_at)"
+    )
+    conn.execute(
+        "UPDATE runs SET runtime_status = status WHERE runtime_status <> status"
     )
 
 
@@ -1443,6 +1732,136 @@ def ensure_column(
     if any(column["name"] == column_name for column in columns):
         return
     conn.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {definition}")
+
+
+def _enable_sqlite_schema_rebuild(conn: Database) -> None:
+    """Enter the only safe mode for SQLite table replacement.
+
+    SQLite normally rewrites every child foreign key when a table is renamed.
+    During the ``runs`` rebuild that would temporarily point children at the
+    legacy table name and leave them broken after it is dropped.  Commit first
+    because ``foreign_keys`` cannot change in an active transaction.
+    """
+    conn.commit()
+    conn.execute("PRAGMA foreign_keys = OFF")
+    conn.execute("PRAGMA legacy_alter_table = ON")
+
+
+def _restore_sqlite_schema_rebuild(conn: Database) -> None:
+    conn.commit()
+    conn.execute("PRAGMA legacy_alter_table = OFF")
+    conn.execute("PRAGMA foreign_keys = ON")
+
+
+def _repair_sqlite_runs_foreign_keys(conn: Database) -> None:
+    """Repair databases created by the old ``runs`` rename migration.
+
+    The affected SQLite schema stored ``runs_legacy_input_message`` in child
+    foreign keys.  Recreate only affected child tables, preserving their rows
+    and named indexes, then point those references back at the canonical table.
+    """
+    affected = conn.execute(
+        """SELECT name, sql FROM sqlite_master
+           WHERE type = 'table' AND name <> 'runs'
+             AND sql LIKE '%runs_legacy_input_message%'"""
+    ).fetchall()
+    if not affected:
+        return
+
+    _enable_sqlite_schema_rebuild(conn)
+    try:
+        saved_indexes: list[str] = []
+        temporary_tables: list[tuple[str, str]] = []
+        for row in affected:
+            table_name = str(row["name"])
+            schema = str(row["sql"] or "")
+            temporary_name = f"{table_name}__runs_fk_repair"
+            name_match = re.match(
+                r"^(CREATE TABLE\s+(?:IF NOT EXISTS\s+)?)(\"[^\"]+\"|[^\s(]+)",
+                schema,
+                flags=re.IGNORECASE,
+            )
+            if name_match is None or name_match.group(2).strip('"') != table_name:
+                raise RuntimeError(f"cannot repair SQLite foreign key for {table_name}")
+            rebuilt_schema = (
+                f'{name_match.group(1)}"{temporary_name}"{schema[name_match.end():]}'
+                .replace("runs_legacy_input_message", "runs")
+            )
+            index_rows = conn.execute(
+                """SELECT sql FROM sqlite_master
+                   WHERE type = 'index' AND tbl_name = ? AND sql IS NOT NULL""",
+                (table_name,),
+            ).fetchall()
+            saved_indexes.extend(str(index["sql"]) for index in index_rows)
+            column_names = ", ".join(
+                f'"{column["name"]}"'
+                for column in conn.execute(f'PRAGMA table_info("{table_name}")').fetchall()
+            )
+            conn.execute(f'DROP TABLE IF EXISTS "{temporary_name}"')
+            conn.execute(rebuilt_schema)
+            conn.execute(
+                f'INSERT INTO "{temporary_name}" ({column_names}) '
+                f'SELECT {column_names} FROM "{table_name}"'
+            )
+            temporary_tables.append((table_name, temporary_name))
+
+        for table_name, _ in temporary_tables:
+            conn.execute(f'DROP TABLE "{table_name}"')
+        for table_name, temporary_name in temporary_tables:
+            conn.execute(f'ALTER TABLE "{temporary_name}" RENAME TO "{table_name}"')
+        for index_sql in saved_indexes:
+            conn.execute(index_sql)
+    finally:
+        _restore_sqlite_schema_rebuild(conn)
+
+
+def _upgrade_runs_input_message_nullable(conn: Database) -> None:
+    """Repair pre-TD-11 databases where control Runs cannot omit an input.
+
+    ``runs.input_message_id`` has been nullable in the canonical schemas since
+    task and control Runs can be created without a chat message. PostgreSQL can
+    alter that column directly. SQLite needs a table rebuild, so detect only
+    the legacy NOT NULL shape and preserve every existing row and constraint.
+    """
+    if conn.dialect == "postgres":
+        conn.execute("ALTER TABLE runs ALTER COLUMN input_message_id DROP NOT NULL")
+        return
+
+    columns = conn.execute("PRAGMA table_info(runs)").fetchall()
+    input_column = next(
+        (column for column in columns if column["name"] == "input_message_id"), None
+    )
+    if input_column is None or not input_column["notnull"]:
+        _repair_sqlite_runs_foreign_keys(conn)
+        return
+    schema = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'runs'"
+    ).fetchone()
+    if schema is None:
+        return
+    create_sql = schema["sql"] or ""
+    relaxed_sql = re.sub(
+        r"(\binput_message_id\s+TEXT)\s+NOT\s+NULL",
+        r"\1",
+        create_sql,
+        flags=re.IGNORECASE,
+    )
+    if relaxed_sql == create_sql:
+        raise RuntimeError("legacy runs table cannot be migrated safely")
+
+    column_names = ", ".join(column["name"] for column in columns)
+    _enable_sqlite_schema_rebuild(conn)
+    try:
+        conn.execute("ALTER TABLE runs RENAME TO runs_legacy_input_message")
+        conn.execute(relaxed_sql)
+        conn.execute(
+            f"INSERT INTO runs ({column_names}) "
+            f"SELECT {column_names} FROM runs_legacy_input_message"
+        )
+        conn.execute("DROP TABLE runs_legacy_input_message")
+    finally:
+        _restore_sqlite_schema_rebuild(conn)
+    _repair_sqlite_runs_foreign_keys(conn)
 
 
 def _upgrade_approval_type_check(conn: Database) -> None:

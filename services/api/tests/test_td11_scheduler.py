@@ -15,7 +15,7 @@ from app.services.workspace import create_workspace_for_user, new_id, now_iso
 
 def _seed_plan(tmp_path, monkeypatch, *, independent=False):
     monkeypatch.setattr(settings, "database_url", f"sqlite:///{tmp_path / 'scheduler.sqlite3'}")
-    monkeypatch.setattr(settings, "task_workspace_concurrency", 2)
+    monkeypatch.setattr(settings, "task_server_slots", 2)
     monkeypatch.setattr(settings, "task_worker_enabled", False)
     init_db()
     conn = connect()

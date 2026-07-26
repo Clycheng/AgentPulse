@@ -332,7 +332,8 @@ def create_or_reuse_action(
     )
     if approval_id:
         conn.execute(
-            "UPDATE runs SET status = 'waiting_user' WHERE id = ? AND status = 'running'",
+            """UPDATE runs SET status = 'waiting_user', runtime_status = 'waiting_user'
+            WHERE id = ? AND status = 'running'""",
             (run["id"],),
         )
     row = conn.execute("SELECT * FROM business_actions WHERE id = ?", (action_id,)).fetchone()
@@ -359,7 +360,8 @@ def expire_pending_actions(conn: Database) -> None:
                 (timestamp, row["approval_id"]),
             )
         conn.execute(
-            "UPDATE runs SET status = 'running' WHERE id = ? AND status = 'waiting_user'",
+            """UPDATE runs SET status = 'running', runtime_status = 'running'
+            WHERE id = ? AND status = 'waiting_user'""",
             (row["run_id"],),
         )
 
@@ -510,7 +512,8 @@ def resolve_business_approval(
             ("老板拒绝", timestamp, timestamp, action["id"]),
         )
         conn.execute(
-            "UPDATE runs SET status = 'running' WHERE id = ? AND status = 'waiting_user'",
+            """UPDATE runs SET status = 'running', runtime_status = 'running'
+            WHERE id = ? AND status = 'waiting_user'""",
             (action["run_id"],),
         )
 
@@ -573,7 +576,7 @@ class BusinessActionWorker:
                     ("业务动作重试次数已用尽", timestamp, timestamp, row["id"]),
                 )
                 conn.execute(
-                    "UPDATE runs SET status = 'running' "
+                    "UPDATE runs SET status = 'running', runtime_status = 'running' "
                     "WHERE id = ? AND status = 'waiting_user'",
                     (row["run_id"],),
                 )
@@ -654,7 +657,8 @@ class BusinessActionWorker:
                 ),
             )
             conn.execute(
-                "UPDATE runs SET status = 'running' WHERE id = ? AND status = 'waiting_user'",
+                """UPDATE runs SET status = 'running', runtime_status = 'running'
+                WHERE id = ? AND status = 'waiting_user'""",
                 (action["run_id"],),
             )
             _record_external_action_event(
@@ -691,7 +695,8 @@ class BusinessActionWorker:
             )
             if terminal:
                 conn.execute(
-                    "UPDATE runs SET status = 'running' WHERE id = ? AND status = 'waiting_user'",
+                    """UPDATE runs SET status = 'running', runtime_status = 'running'
+                    WHERE id = ? AND status = 'waiting_user'""",
                     (action["run_id"],),
                 )
             _record_external_action_event(

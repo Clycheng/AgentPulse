@@ -91,6 +91,7 @@ def _context(tmp_path, monkeypatch):
     claims = {
         "workspace_id": workspace["id"], "plan_id": plan["id"],
         "task_id": task["id"], "run_id": run["id"], "agent_id": task["owner_agent_id"],
+        "conversation_id": task["conversation_id"],
     }
     return conn, workspace, agents, plan, task, run, claims
 

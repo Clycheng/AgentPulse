@@ -21,6 +21,7 @@ observes it and resumes the run in place, even when no process-local Future exis
 from __future__ import annotations
 
 import asyncio
+import json as _json
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime
 from typing import Any, Protocol
@@ -28,6 +29,7 @@ from typing import Any, Protocol
 from app.core.database import Database
 from app.runtime.hermes_client import RunContext
 from app.runtime.business_tools_auth import create_business_tool_token
+from app.runtime.company_tools_auth import create_company_tool_token
 from app.services.business_actions import enabled_business_tools
 from app.runtime.runs import (
     RunStatus,
@@ -147,7 +149,7 @@ def _persist_run_approval(
 
 
 def resolve_hermes_profile(conn: Database, agent_id: str) -> str | None:
-    """Return the ready Hermes profile for an agent, or None (→ DeepSeek fallback)."""
+    """Return the ready Hermes profile for an agent, or None when unavailable."""
     row = conn.execute(
         "SELECT hermes_profile, status FROM agent_specs WHERE agent_id = ?",
         (agent_id,),
@@ -183,8 +185,11 @@ async def stream_agent_run(
     """
     if existing_run_id:
         existing = get_run(conn, existing_run_id)
-        if existing is None or existing["status"] != RunStatus.QUEUED:
-            raise ValueError("existing run must be queued")
+        if existing is None or existing["status"] not in (
+            RunStatus.QUEUED,
+            RunStatus.LEASED,
+        ):
+            raise ValueError("existing run must be queued or leased")
         if ctx.task_id and existing["task_id"] != ctx.task_id:
             raise ValueError("existing run does not belong to task")
         run_id = existing_run_id
@@ -202,6 +207,30 @@ async def stream_agent_run(
             status=RunStatus.QUEUED,
         )
     ctx.run_id = run_id
+    if (
+        ctx.workspace_id
+        and ctx.agent_id
+        and ctx.conversation_id
+        and not ctx.task_id
+    ):
+        if not any(server.get("name") == "agentpulse-company" for server in ctx.mcp_servers):
+            token = create_company_tool_token(
+                workspace_id=ctx.workspace_id,
+                conversation_id=ctx.conversation_id,
+                plan_id=None,
+                task_id=None,
+                run_id=run_id,
+                agent_id=ctx.agent_id,
+            )
+            from app.core.config import settings
+
+            ctx.mcp_servers.append(
+                {
+                    "name": "agentpulse-company",
+                    "url": settings.company_tools_url,
+                    "headers": {"Authorization": f"Bearer {token}"},
+                }
+            )
     if ctx.context_manifest_id:
         from app.services.company_memory import attach_manifest_to_run
 
@@ -254,6 +283,8 @@ async def stream_agent_run(
     thought_parts: list[str] = []
     usage: dict = {}
     error: str | None = None
+    atomic_tool_active = False
+    paused = False
 
     try:
         async for event in backend.run(ctx, permission_resolver=permission_resolver):
@@ -273,6 +304,7 @@ async def stream_agent_run(
             elif etype == "thinking":
                 thought_parts.append(_chunk_text(event.payload))
             elif etype == "tool_call":
+                atomic_tool_active = True
                 append_run_step(
                     conn, run_id=run_id, type=RunStepType.TOOL_CALL,
                     title=str(event.payload.get("title", "")), payload=event.payload,
@@ -283,6 +315,7 @@ async def stream_agent_run(
                 conn.commit()
                 yield {"type": "tool_call", "payload": event.payload}
             elif etype == "tool_result":
+                atomic_tool_active = False
                 append_run_step(
                     conn, run_id=run_id, type=RunStepType.TOOL_RESULT,
                     payload=event.payload,
@@ -314,10 +347,60 @@ async def stream_agent_run(
                 yield {"type": "approval_required", "payload": event.payload}
             elif etype == "usage":
                 usage = event.payload
+            elif etype == "session":
+                session_id = event.payload.get("session_id")
+                if session_id:
+                    conn.execute(
+                        "UPDATE runs SET hermes_session_id = ? WHERE id = ?",
+                        (session_id, run_id),
+                    )
+                    conn.commit()
             elif etype == "error":
                 error = str(event.payload.get("detail", "unknown error"))
+            current = get_run(conn, run_id)
+            if (
+                current
+                and current.get("pause_requested_at")
+                and not atomic_tool_active
+                and etype not in ("approval_required", "error", "final")
+            ):
+                transition_run(conn, run_id, RunStatus.PAUSING)
+                checkpoint = {
+                    "message_text": "".join(message_parts)[-8000:],
+                    "thought_text": "".join(thought_parts)[-4000:],
+                    "atomic_tool_active": False,
+                    "paused_after_event": etype,
+                }
+                conn.execute(
+                    "UPDATE runs SET checkpoint_json = ? WHERE id = ?",
+                    (_json.dumps(checkpoint, ensure_ascii=False), run_id),
+                )
+                transition_run(conn, run_id, RunStatus.PAUSED)
+                if ctx.task_id:
+                    conn.execute(
+                        """UPDATE tasks SET workflow_status = 'paused',
+                        waiting_reason = 'preempted', checkpoint_json = ?, updated_at = ?
+                        WHERE id = ?""",
+                        (_json.dumps(checkpoint, ensure_ascii=False), _now_iso(), ctx.task_id),
+                    )
+                append_run_step(
+                    conn,
+                    run_id=run_id,
+                    type=RunStepType.STATUS,
+                    status=RunStatus.PAUSED,
+                    title="已在安全点暂停",
+                    payload=checkpoint,
+                )
+                conn.commit()
+                paused = True
+                break
     except Exception as exc:  # backend/transport failure
         error = str(exc)
+
+    if paused:
+        yield {"type": "paused", "run_id": run_id}
+        yield {"type": "message", "message": None}
+        return
 
     thought = "".join(thought_parts).strip()
     if thought:

@@ -7,7 +7,6 @@ from app.core.config import settings
 from app.core.database import connect, init_db
 from app.main import app
 from app.orchestration.brief import confirm_brief
-from app.schemas.run import LlmChatResponse
 from app.services.workspace import add_message, new_id, now_iso
 
 
@@ -38,6 +37,33 @@ def register_user(client: TestClient) -> dict:
     )
     assert response.status_code == 200
     return response.json()
+
+
+def install_fake_hermes(monkeypatch, *, reply_for=None) -> list[object]:
+    """Make route tests exercise the Hermes Run boundary without a subprocess."""
+    calls: list[object] = []
+
+    async def fake_stream_agent_run(
+        conn, *, ctx, backend, input_message_id, permission_resolver=None
+    ):
+        calls.append(ctx)
+        content = reply_for(ctx) if reply_for else f"{ctx.agent_id}：Hermes 已处理。"
+        message = add_message(
+            conn,
+            conversation_id=ctx.conversation_id,
+            sender_type="agent",
+            sender_id=ctx.agent_id,
+            content=content,
+            provider="hermes",
+            model="",
+        )
+        conn.commit()
+        yield {"type": "chunk", "content": content}
+        yield {"type": "message", "message": message}
+
+    monkeypatch.setattr(workspace_routes, "resolve_hermes_profile", lambda _conn, _agent_id: "ap_test_profile")
+    monkeypatch.setattr(workspace_routes, "stream_agent_run", fake_stream_agent_run)
+    return calls
 
 
 def brief_work_items(agent_id: str) -> list[dict]:
@@ -183,40 +209,14 @@ def test_admin_talent_market_catalog_exposes_official_templates(tmp_path, monkey
         conn.close()
 
 
-def test_employee_with_ready_hermes_profile_routes_to_hermes_not_function_loop(
+def test_employee_with_ready_hermes_profile_routes_to_hermes(
     tmp_path, monkeypatch
 ):
-    """An employee with a real, ready Hermes profile must go straight to
-    Hermes — that's the only path that can ever hit the approval gate
-    (ADR 0008). Regression test for a bug where _stream_reply_events tried
-    the Agent Action Bridge (function_loop) FIRST for every employee
-    regardless of Hermes status; since function_loop always "succeeds" (it
-    has its own no-tool-needed fallback), Hermes was silently never reached
-    even for employees explicitly granted real capabilities. Found live
-    2026-07-15: a "运维小哥" employee with a granted run_tests capability and
-    a real ready Hermes profile still answered "I don't have file system
-    access" from the function_loop fallback instead of running for real."""
+    """A ready employee's message must enter the persisted Hermes path."""
 
-    async def fail_if_called(*_a, **_kw):
-        raise AssertionError(
-            "run_function_loop must not be called for an employee with a "
-            "ready Hermes profile — Hermes must be tried first"
-        )
-        yield  # pragma: no cover — makes this an async generator
-
-    async def fake_stream_agent_run(conn, *, ctx, backend, input_message_id, permission_resolver=None):
-        from app.services.workspace import add_message
-        msg = add_message(
-            conn, conversation_id=ctx.conversation_id,
-            sender_type="agent", sender_id=ctx.agent_id,
-            content="来自 Hermes 的真实回复", provider="hermes", model="deepseek-v4-pro",
-        )
-        conn.commit()
-        yield {"type": "chunk", "content": "来自 Hermes 的真实回复"}
-        yield {"type": "message", "message": msg}
-
-    monkeypatch.setattr(workspace_routes, "run_function_loop", fail_if_called)
-    monkeypatch.setattr(workspace_routes, "stream_agent_run", fake_stream_agent_run)
+    calls = install_fake_hermes(
+        monkeypatch, reply_for=lambda _ctx: "来自 Hermes 的真实回复"
+    )
 
     client = make_client(tmp_path, monkeypatch)
     auth = register_user(client)
@@ -268,25 +268,13 @@ def test_employee_with_ready_hermes_profile_routes_to_hermes_not_function_loop(
         body = "".join(resp.iter_text())
 
     assert "来自 Hermes 的真实回复" in body
+    assert calls
 
 
-def test_login_secretary_chat_persists_deepseek_metadata(tmp_path, monkeypatch):
-    async def fake_complete(self, payload):
-        assert payload.agent.name == "小秘"
-        assert payload.messages[-1].content == "帮我拆一下今天的推进计划"
-        # NOTE: Auto-task creation has been removed (ADR 0006)
-        # related_tasks is now empty unless explicitly created
-        return LlmChatResponse(
-            reply="先做三件事：确认目标、拆任务、安排负责人。",
-            provider="deepseek",
-            model=settings.deepseek_model,
-            usage={"total_tokens": 88},
-        )
-
-    monkeypatch.setattr(
-        workspace_routes.DeepSeekChatClient,
-        "complete",
-        fake_complete,
+def test_login_secretary_chat_persists_hermes_metadata(tmp_path, monkeypatch):
+    install_fake_hermes(
+        monkeypatch,
+        reply_for=lambda _ctx: "先做三件事：确认目标、拆任务、安排负责人。",
     )
     client = make_client(tmp_path, monkeypatch)
     register_user(client)
@@ -310,11 +298,9 @@ def test_login_secretary_chat_persists_deepseek_metadata(tmp_path, monkeypatch):
     assert send.status_code == 200
     payload = send.json()
     assert payload["user_message"]["sender_type"] == "user"
-    # Agent Action Bridge: the agent now has tools and may respond differently.
-    # Just verify we got a non-empty response with correct metadata.
     assert len(payload["agent_message"]["content"]) > 10
-    assert payload["agent_message"]["provider"] == "deepseek"
-    assert payload["agent_message"]["model"] == settings.deepseek_model
+    assert payload["agent_message"]["provider"] == "hermes"
+    assert payload["agent_message"]["model"] == ""
     # NOTE: Auto-task creation removed (ADR 0006) - created_task is now None
     assert payload["created_task"] is None
 
@@ -325,27 +311,17 @@ def test_login_secretary_chat_persists_deepseek_metadata(tmp_path, monkeypatch):
         "user",
         "agent",
     ]
-    assert messages[-1]["provider"] == "deepseek"
-    assert messages[-1]["model"] == settings.deepseek_model
+    assert messages[-1]["provider"] == "hermes"
+    assert messages[-1]["model"] == ""
 
 
 def test_knowledge_source_is_injected_into_agent_context(tmp_path, monkeypatch):
-    async def fake_complete(self, payload):
-        assert payload.knowledge_sources
-        assert payload.knowledge_sources[0].title == "品牌定位"
-        assert "一人公司 AI 工作台" in payload.knowledge_sources[0].content
-        return LlmChatResponse(
-            reply="我会按品牌定位来写：突出一人公司 AI 工作台。",
-            provider="deepseek",
-            model="deepseek-v4-flash",
-            usage={"total_tokens": 72},
-        )
+    def reply_for(ctx):
+        assert "品牌定位" in ctx.prompt
+        assert "一人公司 AI 工作台" in ctx.prompt
+        return "我会按品牌定位来写：突出一人公司 AI 工作台。"
 
-    monkeypatch.setattr(
-        workspace_routes.DeepSeekChatClient,
-        "complete",
-        fake_complete,
-    )
+    install_fake_hermes(monkeypatch, reply_for=reply_for)
     client = make_client(tmp_path, monkeypatch)
     auth = register_user(client)
     token = auth["access_token"]
@@ -375,21 +351,8 @@ def test_knowledge_source_is_injected_into_agent_context(tmp_path, monkeypatch):
     assert "一人公司 AI 工作台" in sent.json()["agent_message"]["content"]
 
 
-def test_secretary_chat_can_create_agent_from_recruit_intent(tmp_path, monkeypatch):
-    async def fake_complete(self, payload):
-        assert payload.agent.name == "小秘"
-        return LlmChatResponse(
-            reply="我已经先帮你把市场分析师建好，后续可以继续补充工具和资料库权限。",
-            provider="deepseek",
-            model="deepseek-v4-flash",
-            usage={"total_tokens": 66},
-        )
-
-    monkeypatch.setattr(
-        workspace_routes.DeepSeekChatClient,
-        "complete",
-        fake_complete,
-    )
+def test_secretary_chat_does_not_infer_recruitment_without_a_hermes_tool_receipt(tmp_path, monkeypatch):
+    install_fake_hermes(monkeypatch, reply_for=lambda _ctx: "我会先梳理这个岗位需要的能力。")
     client = make_client(tmp_path, monkeypatch)
     auth = register_user(client)
     token = auth["access_token"]
@@ -405,22 +368,12 @@ def test_secretary_chat_can_create_agent_from_recruit_intent(tmp_path, monkeypat
     assert send.status_code == 200
     payload = send.json()
     assert payload["created_task"] is None
-    assert payload["created_agent"]["name"] == "市场分析师"
-    assert payload["created_agent"]["source"] == "chat_factory"
+    assert payload["created_agent"] is None
 
     reloaded = client.get("/api/me/bootstrap", headers=auth_header(token)).json()
-    agents = {agent["name"]: agent for agent in reloaded["agents"]}
-    assert "市场分析师" in agents
-    departments = {department["name"] for department in reloaded["departments"]}
-    assert "市场部" in departments
-    dm_chats = [
-        chat
-        for chat in reloaded["conversations"]
-        if chat["kind"] == "dm" and chat["agent_id"] == agents["市场分析师"]["id"]
-    ]
-    assert dm_chats
-    messages = reloaded["messages_by_conversation"][secretary_chat["id"]]
-    assert any("已创建员工：市场分析师" in message["content"] for message in messages)
+    assert {agent["name"] for agent in reloaded["agents"]} == {
+        "小秘", "内容策划", "内容主笔", "运营执行"
+    }
 
 
 def test_agent_creation_recruitment_and_group_conversation(tmp_path, monkeypatch):
@@ -553,22 +506,17 @@ def test_agent_creation_recruitment_and_group_conversation(tmp_path, monkeypatch
 def test_group_chat_returns_multiple_agent_replies_when_not_mentioned(
     tmp_path, monkeypatch
 ):
-    captured_agents = []
-
-    async def fake_complete(self, payload):
-        captured_agents.append(payload.agent.name)
-        return LlmChatResponse(
-            reply=f"{payload.agent.name}：我基于群聊上下文补充一条建议。",
-            provider="deepseek",
-            model="deepseek-v4-flash",
-            usage={"total_tokens": 42},
-        )
-
-    monkeypatch.setattr(
-        workspace_routes.DeepSeekChatClient,
-        "complete",
-        fake_complete,
+    calls = install_fake_hermes(
+        monkeypatch, reply_for=lambda ctx: f"{ctx.agent_id}：我基于群聊上下文补充一条建议。"
     )
+
+    async def fake_discussion_round(conn, *, member_agents, turn_executor, **_kwargs):
+        for agent in (member_agents * 2):
+            async for event in turn_executor(conn, agent["id"]):
+                yield event
+        yield {"type": "end", "converged": False, "turns_used": 4}
+
+    monkeypatch.setattr(workspace_routes, "run_discussion_round", fake_discussion_round)
     client = make_client(tmp_path, monkeypatch)
     auth = register_user(client)
     token = auth["access_token"]
@@ -643,8 +591,7 @@ def test_group_chat_returns_multiple_agent_replies_when_not_mentioned(
     assert sender_ids[0] in [analyst["id"], writer["id"]]
     # Speakers alternate
     assert len(set(sender_ids)) == 2
-    # All agents were called (captured_agents may include "主持人" from speaker selection)
-    assert {"增长分析师", "内容策划"}.issubset(set(captured_agents))
+    assert len(calls) == 4
 
     reloaded = client.get("/api/me/bootstrap", headers=auth_header(token)).json()
     persisted = reloaded["messages_by_conversation"][group_id]
@@ -660,7 +607,7 @@ def test_group_chat_returns_multiple_agent_replies_when_not_mentioned(
     agent_sender_ids = [m["sender_id"] for m in persisted[-4:]]
     assert len(set(agent_sender_ids)) == 2
     outputs = reloaded["task_outputs_by_task"][task["id"]]
-    assert {output["agent_id"] for output in outputs} == {analyst["id"], writer["id"]}
+    assert outputs == []
 
     mentioned = client.post(
         f"/api/conversations/{group_id}/messages",
@@ -691,6 +638,9 @@ def test_stream_group_discussion_routes_through_orchestration(tmp_path, monkeypa
 
     monkeypatch.setattr(
         workspace_routes, "run_discussion_round", fake_run_discussion_round
+    )
+    monkeypatch.setattr(
+        workspace_routes, "resolve_hermes_profile", lambda _conn, _agent_id: "ap_test_profile"
     )
 
     client = make_client(tmp_path, monkeypatch)
@@ -750,7 +700,7 @@ def test_stream_group_discussion_routes_through_orchestration(tmp_path, monkeypa
 
 def _give_agent_ready_hermes_profile(agent_id: str, workspace_id: str) -> None:
     """Simulate a completed real Hermes provisioning (same as
-    test_employee_with_ready_hermes_profile_routes_to_hermes_not_function_loop)."""
+    the Hermes-only routing test above)."""
     conn = connect()
     try:
         conn.execute(
@@ -771,59 +721,37 @@ def _give_agent_ready_hermes_profile(agent_id: str, workspace_id: str) -> None:
 def test_group_discussion_auto_creates_brief_when_converged(tmp_path, monkeypatch):
     """讨论轮收敛 → 路由层消费 brief_draft 事件，自动落 draft 共识 brief 并发
     BRIEF_CARD 系统消息；同一会话已有 draft brief 时去重不重复发卡。"""
-    speaker_calls = {"n": 0}
+    install_fake_hermes(monkeypatch, reply_for=lambda ctx: f"{ctx.agent_id}：好的，我补充一点。")
 
-    async def noop_function_loop(**_kwargs):
-        return
-        yield  # pragma: no cover — makes this an async generator
-
-    async def fake_complete(self, payload):
-        if payload.agent.name == "主持人":
-            assert payload.messages[-1].content == "请严格按照系统指令完成输出"
-            prompt = payload.agent.prompt or ""
-            if "判断讨论是否已经充分" in prompt:
-                return LlmChatResponse(
-                    reply='{"converged": true, "missing": []}',
-                    provider="deepseek", model="deepseek-v4-flash", usage={},
-                )
-            if "提炼共识纪要" in prompt:
-                return LlmChatResponse(
-                    reply=json.dumps(
+    async def fake_hermes_control(_conn, **kwargs):
+        prompt = kwargs["prompt"]
+        if "判断讨论是否已经充分" in prompt:
+            return '{"converged": true, "missing": []}'
+        if "提炼共识纪要" in prompt:
+            return json.dumps(
+                {
+                    "goal": "自动产出的共识目标",
+                    "scope": "范围A",
+                    "constraints": "约束B",
+                    "success_criteria": "标准C",
+                    "owner_agent_id": analyst["id"],
+                    "work_items": [
+                        *brief_work_items(analyst["id"])[:1],
                         {
-                            "goal": "自动产出的共识目标",
-                            "scope": "范围A",
-                            "constraints": "约束B",
-                            "success_criteria": "标准C",
-                            "owner_agent_id": analyst["id"],
-                            "work_items": [
-                                *brief_work_items(analyst["id"])[:1],
-                                {
-                                    **brief_work_items(writer["id"])[1],
-                                    "depends_on_keys": ["research"],
-                                },
-                                {
-                                    **brief_work_items(writer["id"])[2],
-                                    "depends_on_keys": ["draft"],
-                                },
-                            ],
+                            **brief_work_items(writer["id"])[1],
+                            "depends_on_keys": ["research"],
                         },
-                        ensure_ascii=False,
-                    ),
-                    provider="deepseek", model="deepseek-v4-flash", usage={},
-                )
-            # 选人：返回非 JSON → 编排层 round-robin 兜底，轮流发言跑满 4 轮
-            speaker_calls["n"] += 1
-            return LlmChatResponse(
-                reply="我选不出来",
-                provider="deepseek", model="deepseek-v4-flash", usage={},
+                        {
+                            **brief_work_items(writer["id"])[2],
+                            "depends_on_keys": ["draft"],
+                        },
+                    ],
+                },
+                ensure_ascii=False,
             )
-        return LlmChatResponse(
-            reply=f"{payload.agent.name}：好的，我补充一点。",
-            provider="deepseek", model="deepseek-v4-flash", usage={},
-        )
+        return "not-json"
 
-    monkeypatch.setattr(workspace_routes, "run_function_loop", noop_function_loop)
-    monkeypatch.setattr(workspace_routes.DeepSeekChatClient, "complete", fake_complete)
+    monkeypatch.setattr(workspace_routes, "run_hermes_control", fake_hermes_control)
 
     client = make_client(tmp_path, monkeypatch)
     auth = register_user(client)
@@ -1036,25 +964,10 @@ def test_group_reply_agents_not_limited_to_three(tmp_path, monkeypatch):
         conn.close()
 
 
-def test_secretary_with_hermes_profile_uses_function_loop_first(tmp_path, monkeypatch):
-    """小秘（system_secretary）即使有 ready Hermes profile 也必须先走 Agent
-    Action Bridge——招人/建群/建任务等系统工具只挂在 function_loop 上，先走
-    Hermes 她永远拿不到工具（只会嘴上答应）。Bridge 成功时 Hermes 不该被调用。"""
-    calls = {"function_loop": 0}
-
-    async def fake_function_loop(**_kwargs):
-        calls["function_loop"] += 1
-        yield {"type": "tool_call", "payload": {"name": "create_task"}}
-        yield {"type": "chunk", "content": "已通过系统工具处理好"}
-
-    async def fail_stream_agent_run(*_a, **_kw):
-        raise AssertionError(
-            "小秘在 function_loop 成功时不该走 Hermes（stream_agent_run 被调用）"
-        )
-        yield  # pragma: no cover — makes this an async generator
-
-    monkeypatch.setattr(workspace_routes, "run_function_loop", fake_function_loop)
-    monkeypatch.setattr(workspace_routes, "stream_agent_run", fail_stream_agent_run)
+def test_secretary_with_hermes_profile_uses_hermes_for_both_message_paths(tmp_path, monkeypatch):
+    calls = install_fake_hermes(
+        monkeypatch, reply_for=lambda _ctx: "已通过 Hermes Run 处理。"
+    )
 
     client = make_client(tmp_path, monkeypatch)
     auth = register_user(client)
@@ -1063,19 +976,17 @@ def test_secretary_with_hermes_profile_uses_function_loop_first(tmp_path, monkey
     secretary = bootstrap["agents"][0]
     assert secretary["source"] == "system_secretary"
     secretary_dm = bootstrap["conversations"][0]
-    _give_agent_ready_hermes_profile(secretary["id"], auth["workspace"]["id"])
-
-    # 非流式路径（complete_agent_reply）
+    # Non-streaming path.
     send = client.post(
         f"/api/conversations/{secretary_dm['id']}/messages",
         headers=auth_header(token),
         json={"content": "今天有什么安排？"},
     )
     assert send.status_code == 200
-    assert send.json()["agent_message"]["content"] == "已通过系统工具处理好"
-    assert calls["function_loop"] == 1
+    assert send.json()["agent_message"]["content"] == "已通过 Hermes Run 处理。"
+    assert len(calls) == 1
 
-    # 流式路径（_stream_reply_events）
+    # Streaming path.
     with client.stream(
         "POST",
         f"/api/conversations/{secretary_dm['id']}/messages/stream",
@@ -1083,18 +994,13 @@ def test_secretary_with_hermes_profile_uses_function_loop_first(tmp_path, monkey
         json={"content": "今天有什么安排？"},
     ) as resp:
         body = "".join(resp.iter_text())
-    assert "已通过系统工具处理好" in body
-    assert calls["function_loop"] == 2
+    assert "已通过 Hermes Run 处理。" in body
+    assert len(calls) == 2
 
 
 def test_group_discussion_secretary_cannot_use_action_bridge(tmp_path, monkeypatch):
-    """Discussion-mode production routing keeps the secretary away from
-    create_task/create_group tools until the owner launches a valid brief."""
+    """Discussion-mode production routing keeps plan mutations behind a brief."""
     calls = {"hermes": 0}
-
-    async def fail_function_loop(**_kwargs):
-        raise AssertionError("discussion turn must not call the Action Bridge")
-        yield  # pragma: no cover
 
     async def fake_stream_agent_run(conn, *, ctx, **_kwargs):
         calls["hermes"] += 1
@@ -1123,7 +1029,6 @@ def test_group_discussion_secretary_cannot_use_action_bridge(tmp_path, monkeypat
             yield event
         yield {"type": "end", "converged": False, "turns_used": 1}
 
-    monkeypatch.setattr(workspace_routes, "run_function_loop", fail_function_loop)
     monkeypatch.setattr(workspace_routes, "stream_agent_run", fake_stream_agent_run)
     monkeypatch.setattr(workspace_routes, "run_discussion_round", fake_discussion_round)
 
@@ -1148,22 +1053,10 @@ def test_group_discussion_secretary_cannot_use_action_bridge(tmp_path, monkeypat
         conn.close()
 
 
-def test_recruit_intent_not_triggered_outside_secretary_dm(tmp_path, monkeypatch):
-    """招聘意图正则只在小秘私聊生效：群聊/普通员工 DM 里说"招个分析师"是在
-    讨论需求，不该被截胡建一个无能力的纸片员工（chat_factory）。"""
+def test_recruitment_is_never_inferred_by_a_message_route(tmp_path, monkeypatch):
+    """A route never turns words into a mutation; Hermes MCP must do it."""
 
-    async def noop_function_loop(**_kwargs):
-        return
-        yield  # pragma: no cover — makes this an async generator
-
-    async def fake_complete(self, payload):
-        return LlmChatResponse(
-            reply=f"{payload.agent.name}：收到，我们先讨论。",
-            provider="deepseek", model="deepseek-v4-flash", usage={},
-        )
-
-    monkeypatch.setattr(workspace_routes, "run_function_loop", noop_function_loop)
-    monkeypatch.setattr(workspace_routes.DeepSeekChatClient, "complete", fake_complete)
+    install_fake_hermes(monkeypatch, reply_for=lambda _ctx: "收到，我们先讨论。")
 
     client = make_client(tmp_path, monkeypatch)
     auth = register_user(client)
@@ -1226,22 +1119,13 @@ def test_recruit_intent_not_triggered_outside_secretary_dm(tmp_path, monkeypatch
 
 
 def test_task_api_updates_and_injects_related_context(tmp_path, monkeypatch):
-    captured_payloads = []
+    captured_prompts: list[str] = []
 
-    async def fake_complete(self, payload):
-        captured_payloads.append(payload)
-        return LlmChatResponse(
-            reply="我会基于关联任务推进：先确认文案目标，再产出首屏草案。",
-            provider="deepseek",
-            model="deepseek-v4-flash",
-            usage={"total_tokens": 96},
-        )
+    def reply_for(ctx):
+        captured_prompts.append(ctx.prompt)
+        return "我会基于关联任务推进：先确认文案目标，再产出首屏草案。"
 
-    monkeypatch.setattr(
-        workspace_routes.DeepSeekChatClient,
-        "complete",
-        fake_complete,
-    )
+    install_fake_hermes(monkeypatch, reply_for=reply_for)
     client = make_client(tmp_path, monkeypatch)
     auth = register_user(client)
     token = auth["access_token"]
@@ -1312,11 +1196,9 @@ def test_task_api_updates_and_injects_related_context(tmp_path, monkeypatch):
         json={"content": "继续推进这个任务"},
     )
     assert send.status_code == 200
-    assert captured_payloads
-    llm_payload = captured_payloads[-1]
-    assert llm_payload.related_tasks[0].title == "官网首屏文案"
-    assert llm_payload.related_tasks[0].status == "待确认"
-    assert llm_payload.related_tasks[0].owner_name == "内容策划"
+    assert captured_prompts
+    assert "官网首屏文案" in captured_prompts[-1]
+    assert "待确认" in captured_prompts[-1]
 
     reloaded = client.get("/api/me/bootstrap", headers=auth_header(token)).json()
     messages = reloaded["messages_by_conversation"][dm_chat["id"]]
@@ -1324,42 +1206,7 @@ def test_task_api_updates_and_injects_related_context(tmp_path, monkeypatch):
     assert any("任务更新：官网首屏文案 · 待确认" in message["content"] for message in messages)
     events = reloaded["task_events_by_task"][task_payload["id"]]
     assert any(event["kind"] == "approval_requested" for event in events)
-    assert any(event["kind"] == "agent_output_generated" for event in events)
-    outputs = reloaded["task_outputs_by_task"][task_payload["id"]]
-    assert outputs[0]["content"] == "我会基于关联任务推进：先确认文案目标，再产出首屏草案。"
-    approvals = reloaded["approvals_by_task"][task_payload["id"]]
-    assert approvals[0]["status"] == "pending"
-
-    resolved = client.post(
-        f"/api/approvals/{approvals[0]['id']}/resolve",
-        headers=auth_header(token),
-        json={"status": "approved"},
-    )
-    assert resolved.status_code == 200
-    assert resolved.json()["status"] == "approved"
-
-    completed = client.get("/api/me/bootstrap", headers=auth_header(token)).json()
-    completed_task = next(
-        task for task in completed["tasks"] if task["id"] == task_payload["id"]
-    )
-    assert completed_task["status"] == "已完成"
-    completed_events = completed["task_events_by_task"][task_payload["id"]]
-    assert any(event["kind"] == "approval_resolved" for event in completed_events)
-    experiences = completed["agent_experiences_by_agent"][agent["id"]]
-    assert experiences[0]["task_id"] == task_payload["id"]
-    assert experiences[0]["outcome"] == "success"
-    assert "老板已确认通过" in experiences[0]["summary"]
-
-    follow_up = client.post(
-        f"/api/conversations/{dm_chat['id']}/messages",
-        headers=auth_header(token),
-        json={"content": "参考之前的经验，再给我一个下一步建议"},
-    )
-    assert follow_up.status_code == 200
-    experience_payload = captured_payloads[-1]
-    assert experience_payload.agent_experiences
-    assert experience_payload.agent_experiences[0].outcome == "success"
-    assert "官网首屏文案" in experience_payload.agent_experiences[0].summary
+    assert reloaded["task_outputs_by_task"][task_payload["id"]] == []
 
 
 def test_rejected_approval_creates_agent_lesson_experience(tmp_path, monkeypatch):
@@ -1884,6 +1731,175 @@ def test_local_project_request_never_falls_into_fake_recruitment(tmp_path, monke
     ]
 
 
+def test_streamed_local_project_request_queues_local_worker_run(tmp_path, monkeypatch):
+    """The production SSE path must not fall back to a cloud chat reply."""
+    client = make_client(tmp_path, monkeypatch)
+    auth = register_user(client)
+    headers = auth_header(auth["access_token"])
+    bootstrap = client.get("/api/me/bootstrap", headers=headers).json()
+    secretary_chat = next(
+        conversation
+        for conversation in bootstrap["conversations"]
+        if conversation["kind"] == "dm" and conversation["agent_id"] == bootstrap["agents"][0]["id"]
+    )
+
+    device = client.post(
+        "/api/local-devices/register",
+        headers=headers,
+        json={
+            "device_name": "测试 Mac",
+            "platform": "darwin",
+            "architecture": "arm64",
+            "worker_version": "test",
+            "hermes_version": "0.18.2",
+            "capabilities": {"read_file": True},
+        },
+    ).json()
+    device_headers = {"Authorization": f"Bearer {device['device_token']}"}
+    heartbeat = client.post(
+        f"/api/local-devices/{device['id']}/heartbeat",
+        headers=device_headers,
+        json={"hermes_version": "0.18.2"},
+    )
+    assert heartbeat.status_code == 200
+    project = client.post(
+        "/api/local-projects",
+        headers=headers,
+        json={
+            "device_id": device["id"],
+            "display_name": "agentpulse",
+            "path_hash": "b" * 64,
+            "allowed_scopes": ["read"],
+        },
+    )
+    assert project.status_code == 200
+
+    with client.stream(
+        "POST",
+        f"/api/conversations/{secretary_chat['id']}/messages/stream",
+        headers=headers,
+        json={"content": "读取本机项目中的 README.md 并汇报。"},
+    ) as response:
+        body = "".join(response.iter_text())
+
+    assert response.status_code == 200
+    assert '"execution_target": "local_desktop"' in body
+    assert "当前尚未读取文件" in body
+    assert "真实调用 DeepSeek" not in body
+    conn = connect()
+    try:
+        run = conn.execute("SELECT * FROM runs ORDER BY created_at DESC LIMIT 1").fetchone()
+        assert run["execution_target"] == "local_desktop"
+        assert run["local_project_id"] == project.json()["id"]
+        assert run["input_message_id"]
+        input_message = conn.execute(
+            "SELECT content FROM messages WHERE id = ?", (run["input_message_id"],)
+        ).fetchone()
+        assert input_message["content"] == "读取本机项目中的 README.md 并汇报。"
+    finally:
+        conn.close()
+
+
+def test_local_worker_run_runtime_status_tracks_lease_completion_and_failure(
+    tmp_path, monkeypatch
+):
+    client = make_client(tmp_path, monkeypatch)
+    auth = register_user(client)
+    headers = auth_header(auth["access_token"])
+    bootstrap = client.get("/api/me/bootstrap", headers=headers).json()
+    secretary_chat = next(
+        conversation
+        for conversation in bootstrap["conversations"]
+        if conversation["kind"] == "dm" and conversation["agent_id"] == bootstrap["agents"][0]["id"]
+    )
+
+    device = client.post(
+        "/api/local-devices/register",
+        headers=headers,
+        json={
+            "device_name": "测试 Mac",
+            "platform": "darwin",
+            "architecture": "arm64",
+            "worker_version": "test",
+            "hermes_version": "0.18.2",
+            "capabilities": {"read_file": True},
+        },
+    ).json()
+    device_headers = {"Authorization": f"Bearer {device['device_token']}"}
+    heartbeat = client.post(
+        f"/api/local-devices/{device['id']}/heartbeat",
+        headers=device_headers,
+        json={"hermes_version": "0.18.2"},
+    )
+    assert heartbeat.status_code == 200
+    project = client.post(
+        "/api/local-projects",
+        headers=headers,
+        json={
+            "device_id": device["id"],
+            "display_name": "agentpulse",
+            "path_hash": "c" * 64,
+            "allowed_scopes": ["read"],
+        },
+    )
+    assert project.status_code == 200
+
+    def queue_local_run(content: str) -> str:
+        with client.stream(
+            "POST",
+            f"/api/conversations/{secretary_chat['id']}/messages/stream",
+            headers=headers,
+            json={"content": content},
+        ) as response:
+            body = "".join(response.iter_text())
+        assert response.status_code == 200
+        assert '"execution_target": "local_desktop"' in body
+        run = client.get(
+            f"/api/local-devices/{device['id']}/runs/next",
+            headers=device_headers,
+        )
+        assert run.status_code == 200
+        payload = run.json()["run"]
+        assert payload is not None
+        return payload["id"]
+
+    completed_run_id = queue_local_run("读取本机项目中的 README.md 并汇报。")
+    leased = client.post(
+        f"/api/runs/{completed_run_id}/lease",
+        headers=device_headers,
+    )
+    assert leased.status_code == 200
+    assert leased.json()["status"] == "running"
+    assert leased.json()["runtime_status"] == "running"
+
+    completed = client.post(
+        f"/api/runs/{completed_run_id}/complete",
+        headers=device_headers,
+        json={"message": "已读取 README。", "usage": {"input_tokens": 1, "output_tokens": 1}},
+    )
+    assert completed.status_code == 200
+    assert completed.json()["status"] == "completed"
+    assert completed.json()["runtime_status"] == "completed"
+    assert completed.json()["local_project_id"] == project.json()["id"]
+
+    failed_run_id = queue_local_run("读取本机项目中的 docs/ARCHITECTURE.md 并汇报。")
+    leased_failed = client.post(
+        f"/api/runs/{failed_run_id}/lease",
+        headers=device_headers,
+    )
+    assert leased_failed.status_code == 200
+    assert leased_failed.json()["runtime_status"] == "running"
+
+    failed = client.post(
+        f"/api/runs/{failed_run_id}/fail",
+        headers=device_headers,
+        json={"error": "worker interrupted"},
+    )
+    assert failed.status_code == 200
+    assert failed.json()["status"] == "failed"
+    assert failed.json()["runtime_status"] == "failed"
+
+
 def test_local_device_token_and_project_are_workspace_scoped(tmp_path, monkeypatch):
     client = make_client(tmp_path, monkeypatch)
     auth = register_user(client)
@@ -1912,7 +1928,14 @@ def test_local_device_token_and_project_are_workspace_scoped(tmp_path, monkeypat
         json={"hermes_version": "0.18.2"},
     )
     assert heartbeat.status_code == 200
-    assert heartbeat.json()["device_token"]
+    assert heartbeat.json()["device_token"] == device["device_token"]
+    # A heartbeat must not revoke concurrent Worker requests that still carry
+    # the valid token. The previous rotation behavior caused intermittent 403s.
+    next_run = client.get(
+        f"/api/local-devices/{device['id']}/runs/next",
+        headers=device_headers,
+    )
+    assert next_run.status_code == 200
 
     project = client.post(
         "/api/local-projects",
@@ -1927,6 +1950,20 @@ def test_local_device_token_and_project_are_workspace_scoped(tmp_path, monkeypat
     assert project.status_code == 200
     assert "path_hash" in project.json()
 
+    duplicate_project = client.post(
+        "/api/local-projects",
+        headers=headers,
+        json={
+            "device_id": device["id"],
+            "display_name": "agentpulse-renamed",
+            "path_hash": "a" * 64,
+            "allowed_scopes": ["read"],
+        },
+    )
+    assert duplicate_project.status_code == 200
+    assert duplicate_project.json()["id"] == project.json()["id"]
+    assert duplicate_project.json()["display_name"] == "agentpulse-renamed"
+
     status = client.get("/api/local-runtime/status", headers=headers)
     assert status.status_code == 200
     assert status.json()["online"] is True
@@ -1940,3 +1977,96 @@ def test_local_device_token_and_project_are_workspace_scoped(tmp_path, monkeypat
     )
     assert public_status.status_code == 200
     assert "device_token" not in public_status.json()
+
+
+def test_registering_replacement_device_retires_old_worker(tmp_path, monkeypatch):
+    client = make_client(tmp_path, monkeypatch)
+    auth = register_user(client)
+    headers = auth_header(auth["access_token"])
+    registration = {
+        "device_name": "测试 Mac",
+        "platform": "darwin",
+        "architecture": "arm64",
+        "worker_version": "test",
+        "hermes_version": "0.18.2",
+    }
+
+    first = client.post("/api/local-devices/register", headers=headers, json=registration)
+    peer = client.post("/api/local-devices/register", headers=headers, json=registration)
+    second = client.post(
+        "/api/local-devices/register",
+        headers=headers,
+        json={**registration, "replaces_device_id": first.json()["id"]},
+    )
+
+    assert first.status_code == 200
+    assert peer.status_code == 200
+    assert second.status_code == 200
+    assert first.json()["id"] != second.json()["id"]
+    first_status = client.get(
+        f"/api/local-devices/{first.json()['id']}/status", headers=headers
+    )
+    assert first_status.status_code == 200
+    assert first_status.json()["status"] == "offline"
+    stale_heartbeat = client.post(
+        f"/api/local-devices/{first.json()['id']}/heartbeat",
+        headers={"Authorization": f"Bearer {first.json()['device_token']}"},
+        json={"hermes_version": "0.18.2"},
+    )
+    assert stale_heartbeat.status_code == 403
+    peer_status = client.get(
+        f"/api/local-devices/{peer.json()['id']}/status", headers=headers
+    )
+    assert peer_status.status_code == 200
+    assert peer_status.json()["status"] == "online"
+
+
+def test_local_runtime_bootstrap_syncs_secret_free_employee_profiles(tmp_path, monkeypatch):
+    client = make_client(tmp_path, monkeypatch)
+    auth = register_user(client)
+    headers = auth_header(auth["access_token"])
+    device = client.post(
+        "/api/local-devices/register",
+        headers=headers,
+        json={
+            "device_name": "测试 Mac",
+            "platform": "darwin",
+            "architecture": "arm64",
+            "worker_version": "test",
+            "hermes_version": "0.18.2",
+        },
+    ).json()
+    device_headers = {"Authorization": f"Bearer {device['device_token']}"}
+
+    bootstrap = client.get("/api/local-runtime/bootstrap", headers=headers)
+    assert bootstrap.status_code == 200
+    payload = bootstrap.json()
+    assert payload["runtime"]["model_configured"] is False
+    assert len(payload["profiles"]) == 4
+    assert "DEEPSEEK_API_KEY" not in json.dumps(payload)
+    assert all(item["profile_name"].startswith("aplocal") for item in payload["profiles"])
+    assert all(len(item["manifest_hash"]) == 64 for item in payload["profiles"])
+
+    sync = client.post(
+        f"/api/local-devices/{device['id']}/profiles/sync",
+        headers=device_headers,
+        json={
+            "profiles": [
+                {
+                    "agent_id": item["agent_id"],
+                    "profile_name": item["profile_name"],
+                    "manifest_hash": item["manifest_hash"],
+                    "status": "ready",
+                }
+                for item in payload["profiles"]
+            ]
+        },
+    )
+    assert sync.status_code == 200
+    status = client.get(
+        f"/api/local-devices/{device['id']}/profiles/status",
+        headers=headers,
+    )
+    assert status.status_code == 200
+    assert len(status.json()["profiles"]) == 4
+    assert all(item["status"] == "ready" for item in status.json()["profiles"])

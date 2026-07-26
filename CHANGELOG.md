@@ -5,6 +5,36 @@
 
 ## [Unreleased]
 
+### 2026-07-26（TD-15：百人 AI 公司资源调度）
+
+- **architecture**：新增 [ADR 0017](docs/decisions/0017-resource-aware-workforce-scheduler.md) 与 [TD-15](docs/tech-design/TD-15-workforce-scheduler.md)。保留 Hermes、brief 门、数据库 Run 与动态 MCP，取代 ADR 0010 的固定并发 2 和最多两次调整限制。
+- **feat(workforce)**：新增持久 WorkRequest、Fibonacci Story Point、可审计优先级与老化、每员工单前台槽、安全抢占窗口、四类依赖、独立评审、资源租约和独立 Hermes coordination Run；请求送达不冒充员工已读，所有真实决定仍走 Hermes ACP。
+- **feat(runtime/local-worker)**：业务入队、优先级、容量领取和计划汇总收敛到 `orchestration/workforce.py`；PostgreSQL 以 `SKIP LOCKED` 加事务级 advisory lock 串行员工/容量/独占资源竞争，SQLite 使用事务领取。保存 ACP session/checkpoint 并恢复同一 session。本机 Worker 改为资源感知批量 claim 与并行进程池，写任务使用 Git worktree，`computer_use` 独占，安全点通过 ACP cancel 完成暂停握手。
+- **feat(product/events)**：桌面端增加公司运行总览和员工工作台，展示当前任务、请求箱、个人队列、SP/分数、暂停项、依赖与资源。请求、决定、依赖、抢占、恢复和协调进入 `company_events` 并由 `/api/workforce/events` SSE 推送。
+- **migration/test**：新增向前 Alembic `15a100c0f001`，保留并映射旧状态；独立 SQLite upgrade 已通过。TD-15 自动测试覆盖评分/抢占、依赖环/评审/资源、Hermes triage/coordination 生产路径、本机原子 claim 和 100 名员工每人 10 个 Run 的 1-30 槽调度。真实 Hermes/双平台发布验收仍列为 TD-15-T7。
+- **fix(invariants)**：硬产出依赖现在必须同时满足任务完成与匹配类型的持久交付物；所有 Run 状态迁移和异常恢复同步派生 `runtime_status`，启动迁移修复历史冲突。公司总览、部门、员工行和详情抽屉统一读取 `agent_work_states`，并为 workforce SSE 增加不污染事件账本的心跳。
+- **fix(postgresql/restart)**：真实 PostgreSQL 老库冷启动修正 TD-13 建表与 `runs.context_manifest_id` 外键补列顺序；数据库占位符转换会转义 psycopg 的字面 `%`；Run 状态迁移改用 PostgreSQL 可推断空值类型的 `COALESCE`。桌面重复注册同一物理实例时旧设备会转为 `offline` 且旧 Worker Token 失效，不再在公司总览留下多个假在线设备。
+- **e2e(macOS)**：使用 PostgreSQL + 真 Hermes v0.18.2 + Electron Worker 连续冷启动验收。四个服务端 profile 全部 `ready`；WorkRequest 自动完成 `delivered → answered` 并保存 Hermes session；本机只读 Run 由资源感知批量 claim 领取，真实读取 `README.md`，`read_file` Receipt、RunStep、最终消息与 `completed` 状态一致。测试项目授权已撤销；Windows、请求抢占后恢复和 1-30 真槽压测仍属于 TD-15-T7。
+- **fix(dev-bootstrap)**：`npm run dev` 现在显式默认使用本地 PostgreSQL 并启用真实 Hermes profile 供给，避免 `services/api/.env` 将普通开发启动静默覆盖成 SQLite + 禁用供给，导致新员工回复“profile 尚未就绪”；调用方仍可通过显式环境变量覆盖这两个默认值。
+- **e2e(clean-slate)**：删除 AgentPulse 本地 PostgreSQL 卷、SQLite 开发库、Electron 状态和项目生成的 Hermes profiles 后，从空库执行无额外环境变量的 `npm run dev`。新注册四名员工全部 `ready`，小秘私聊真实返回 `Hermes ACP / PROFILE_READY_OK`，Run 为 `completed` 且保存 session；完整重启 PostgreSQL、API、Desktop 和 Local Worker 后消息、Run 与 session 均保持一致。
+- **fix/local-e2e(local-path-authorization)**：新增 ADR 0018。老板在桌面消息中明确输入真实本机绝对目录或文件时，Electron 先在本机校验并自动登记当前 Worker 项目，再把 `local_project_id` 随消息发送，不再出现路径已脱敏却提示“尚未授权”的矛盾。`startLocalWorker()` 改为幂等并发单飞，避免登录恢复、设置页和重连竞争注册多个设备；读取直接执行，写入、终端和 `computer_use` 审批保持不变。真机直接发送 AgentPulse 绝对路径后，项目自动绑定，Run `run_cdcc0f8b94594e5b92f52e62f8a29cd0` 完成并保存 session，`read_file` 回执为 `succeeded`，小秘真实返回 README 一级标题；旧失败测试消息和对应公司事件已清理。
+
+### 2026-07-25（本机 Hermes Run 状态收尾对齐）
+
+- **fix(local-runtime)**：`/api/runs/{id}/lease` 在本机 Worker 真正领取 queued Run 时同步把 `runs.runtime_status` 从 `queued` 切到 `running`；续租同样保持为 `running`。此前本机 Run 即使已被 Worker 接管、落下 `run_steps` 和 `execution_receipts`，`runtime_status` 仍会永远停在 `queued`。
+- **fix(local-runtime)**：`/api/runs/{id}/complete` 与 `/api/runs/{id}/fail` 现在分别把 `runtime_status` 收尾为 `completed` / `failed`，与主状态机一致，避免桌面端或后续调试误判为“还在排队/尚未执行”。
+- **test**：新增 API 回归覆盖本机 Run 的 `queued → running → completed` 与 `queued → running → failed` 两条路径；`python3 -m pytest services/api/tests/test_workspace_flow.py -q` 通过（29 passed）。
+
+### 2026-07-25（ADR 0016：Hermes-only 执行边界与本机消息回传修复）
+
+- **architecture**：所有员工聊天、控制操作和本机任务统一经 Hermes ACP Run。删除 API 直连 DeepSeek 聊天客户端和 function loop；`/api/runs/llm-chat` 固定返回 410。DeepSeek 仅保留为 Hermes 可替换的模型供应商，凭证仍按 Run 短期注入。
+- **fix(runtime-boundaries)**：所有聊天入口（含 Webhook）在入库前脱敏 macOS/Windows 本机绝对路径；脱敏后的本机请求仍会 fail-close，不能绕过桌面 Local Worker。计划任务禁止经旧 `update_task` 或任务绑定审批直接标记完成，必须由调度器验证交付物（最终项含 `content_package_v1`）。
+- **refactor(runtime)**：服务端与本机 profile 共用一份确定性的员工 SOUL；Profile `ready` 判断统一到 `resolve_hermes_profile`；服务端文件 I/O 与 Worker 都先检查路径穿越和符号链接逃逸，再解析实际路径。删除无生产调用的进程内审批 bridge、旧 SOUL LLM 草稿器及其测试，审批续跑唯一依赖数据库决定轮询。
+- **fix(desktop)**：实时 SSE 与轮询恢复的审批卡共用同一序列化函数，业务动作的渠道、发件人、收件人、正文摘要、风险策略不会因传输方式不同而丢失。
+- **fix(local-worker)**：修复 ACP 最终 `session_update` 在 Worker 退出时丢失造成的假失败；同一协议帧完整、去重地回传原生工具事件。对 ACP v0.18 漏发完成事件的只读工具，仅在已观察到真实开始事件且整个 Hermes Run 成功结束后收口回执；写入和命令仍必须有明确完成事件或审批结果。真实本机 `README.md` 读取已验证为 completed，主 `read_file` 回执为 `succeeded`，RunStep、回执和聊天最终消息一致。
+- **fix(desktop)**：本机 Run 入队 SSE 结束后轮询持久 Run 并刷新当前会话，队列状态会自动更新为真实 Hermes 结果。开发默认使用固定 `runtime-stage`，不再静默回退系统 PATH 的 Hermes/Python。
+- **test**：删除旧直连模型循环与 DSML 执行解析，保留 410 回归；Hermes-only 边界扫描无 `DeepSeekChatClient`、`run_function_loop` 或 `/chat/completions`。全套 API **355 passed / 9 skipped**、桌面 lint/Electron build 和内置 runtime 自检通过；真机桌面读取流程通过。
+
 ### 2026-07-25（TD-14R-P1：开箱即用本机 Hermes 合同开始）
 
 - **architecture**：新增 ADR 0015 与 TD-14R-P1 验收合同。桌面产品的完成标准固定为“安装包内置 Hermes/Python/Worker，用户无需安装或启动 Hermes”；生产执行改用 ACP，禁止把开发机 PATH Hermes 或 `-z/--safe-mode` 当作产品运行时。

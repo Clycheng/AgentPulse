@@ -18,7 +18,7 @@ const translations = {
   },
   "auth": {
     "heroTitle": "Turn your one-person company into an AI team.",
-    "heroSubtitle": "Sign up to create a four-person content team. Connect your DeepSeek key to start discussing, delegating, and executing work.",
+    "heroSubtitle": "Sign up to create a four-person content team. Configure a DeepSeek key for Hermes to start discussing, delegating, and executing work.",
     "feature1Title": "Organized agents",
     "feature1Desc": "Departments, employees, and role prompts all persist",
     "feature2Title": "Start from a message",
@@ -98,25 +98,25 @@ const translations = {
     "loading": "Loading…"
   },
   "modelSettings": {
-    "title": "Model settings",
-    "summary": "Manage the model credential used by AI employees in this workspace",
+    "title": "Hermes model credentials",
+    "summary": "Manage model credentials used only by Hermes Runs in this workspace",
     "configured": "Connected",
     "unconfigured": "Setup required",
-    "apiKey": "DeepSeek API Key",
+    "apiKey": "DeepSeek API Key (Hermes only)",
     "notSet": "Not configured",
     "teamSupply": "Team status",
     "teamSupplyValue": "{{ready}} / {{total}} employees ready",
     "validation": "Credential status",
     "valid": "Verified",
     "pending": "Awaiting verification",
-    "configureKey": "Connect DeepSeek",
+    "configureKey": "Configure Hermes model",
     "replaceKey": "Replace key",
     "revokeKey": "Revoke key",
     "revokeConfirm": "Revoking stops all new runs while preserving history. Continue?",
-    "modalTitle": "Connect DeepSeek",
-    "modalSubtitle": "After the key is verified, the four employees in this workspace are provisioned automatically.",
+    "modalTitle": "Configure Hermes model",
+    "modalSubtitle": "The key is injected only into short-lived Hermes Runs. The four employees in this workspace are provisioned automatically.",
     "validating": "Validating…",
-    "saveKey": "Verify and connect"
+    "saveKey": "Verify and configure"
   },
   "ideas": {
     "title": "Idea Center",

@@ -1,8 +1,9 @@
-"""Provisioning orchestration: role_spec drafting + SOUL.md generation (TD-04-T3).
+"""Provisioning orchestration: role_spec drafting (TD-04-T3).
 
-Two core functions:
+Core function:
 - draft_role_spec: LLM drafts responsibilities + capability keys, with hard validation
-- draft_soul_md: LLM generates SOUL.md from role spec
+
+SOUL.md is deterministic and runtime-neutral in ``runtime.employee_soul``.
 
 Security rules (hardcoded, not up to LLM):
 - Unknown capability keys are silently stripped
@@ -17,10 +18,6 @@ from typing import Any
 
 from app.orchestration.capability_catalog import (
     CATALOG,
-    CapabilityDef,
-    get_capability,
-    resolve_bundle,
-    validate_capability_keys,
 )
 
 # Prompts for LLM drafting
@@ -40,29 +37,6 @@ _ROLE_SPEC_SYSTEM_PROMPT = """你是一个 AI 员工配置助手。根据用户�
 2. suggested_capability_keys 只从上面的可用 key 中选取
 3. 根据用户描述合理推断需要的能力，宁多勿少
 """
-
-_SOUL_MD_SYSTEM_PROMPT = """你是一个 AI 人格设计专家。根据员工角色信息，生成 SOUL.md 文件内容。
-
-SOUL.md 是 Hermes Agent 的人格文件，定义了 AI 员工的行为准则。
-
-格式要求：
-- 以 Markdown 格式输出
-- 第一行是 # 角色名
-- 包含以下章节：## 角色定位、## 核心职责、## 行为准则、## 沟通风格
-- 行为准则必须包含：背景不清楚时先提问，不盲目执行
-- 语气专业但友好
-- 不超过 500 字
-
-公司名：{company_name}
-产品：AI 公司工作台（AgentPulse）
-
-员工职责：
-{responsibilities_text}
-
-员工能力：
-{capabilities_text}
-"""
-
 
 class RoleSpecDraft:
     """Result of drafting a role spec."""
@@ -154,95 +128,3 @@ def build_role_spec_prompt(source_request: str) -> str:
         f"- {key}: {cap.description}" for key, cap in sorted(CATALOG.items())
     )
     return _ROLE_SPEC_SYSTEM_PROMPT.format(available_keys=available_keys)
-
-
-def build_soul_md_prompt(
-    role_name: str,
-    responsibilities: list[str],
-    capability_keys: list[str],
-    company_name: str = "我的公司",
-) -> str:
-    """Build the system prompt for SOUL.md generation.
-
-    Args:
-        role_name: Role name
-        responsibilities: List of responsibilities
-        capability_keys: Validated capability keys
-        company_name: Company name for personalization
-
-    Returns:
-        System prompt string for LLM call
-    """
-    cap_descriptions = []
-    for key in capability_keys:
-        cap = get_capability(key)
-        cap_descriptions.append(f"- {key}: {cap.description}")
-
-    caps_text = "\n".join(cap_descriptions) if cap_descriptions else "无特定能力要求"
-    resp_text = "\n".join(f"- {r}" for r in responsibilities) if responsibilities else "待补充"
-
-    return _SOUL_MD_SYSTEM_PROMPT.format(
-        company_name=company_name,
-        responsibilities_text=resp_text,
-        capabilities_text=caps_text,
-    )
-
-
-def draft_soul_md(
-    role_name: str,
-    responsibilities: list[str],
-    capability_keys: list[str],
-    company_name: str = "我的公司",
-    llm_soul_text: str | None = None,
-) -> str:
-    """Generate a SOUL.md string for an agent.
-
-    If llm_soul_text is provided (from LLM call), it's used as-is
-    (the prompt already constrains format).
-    If not, a template-based fallback is generated.
-
-    Args:
-        role_name: Role name
-        responsibilities: List of responsibilities
-        capability_keys: Validated capability keys
-        company_name: Company name
-        llm_soul_text: LLM-generated SOUL.md text (optional)
-
-    Returns:
-        SOUL.md content string
-    """
-    if llm_soul_text:
-        return llm_soul_text
-
-    # Fallback template (when no LLM available)
-    cap_descriptions = []
-    for key in capability_keys:
-        cap = get_capability(key)
-        cap_descriptions.append(f"- {cap.description}")
-
-    caps_section = "\n".join(cap_descriptions) if cap_descriptions else "暂无"
-    resp_section = "\n".join(f"- {r}" for r in responsibilities) if responsibilities else "- 待确认"
-
-    return f"""# {role_name}
-
-## 角色定位
-你是{company_name}的{role_name}，负责以下职责：
-{resp_section}
-
-## 核心职责
-{resp_section}
-
-## 行为准则
-- 背景不清楚时先提问，不盲目执行
-- 涉及高风险操作（部署生产、花钱、不可逆操作）必须请示老板
-- 主动汇报工作进展
-- 遇到问题及时沟通，不隐瞒
-
-## 沟通风格
-- 专业、简洁、友好
-- 用中文沟通
-- 关键信息用列表呈现
-
-## 能力范围
-{caps_section}
-"""

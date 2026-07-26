@@ -20,7 +20,7 @@ from app.orchestration.team_compiler import (
     build_team_draft_prompt,
     parse_team_draft,
 )
-from app.runtime.deepseek import DeepSeekAPIError, DeepSeekChatClient, DeepSeekNotConfigured
+from app.runtime.hermes_control import HermesControlUnavailable, run_hermes_control
 from app.schemas.agent_spec import (
     CreateTeamMemberOut,
     CreateTeamRequest,
@@ -29,7 +29,6 @@ from app.schemas.agent_spec import (
     DraftTeamResponse,
     TeamMemberDraft,
 )
-from app.schemas.run import LlmChatAgent, LlmChatMessage, LlmChatRequest
 from app.services.workspace import (
     add_message,
     create_agent,
@@ -39,7 +38,6 @@ from app.services.workspace import (
     now_iso,
     provision_new_agent,
 )
-from app.services.model_credentials import deepseek_client_for_workspace
 
 router = APIRouter(tags=["team-compiler"])
 
@@ -53,29 +51,38 @@ async def draft_team(
     """Parse the description into role drafts. Nothing is created here —
     this is the "预览" step: the owner reviews/edits the drafts before
     POST /agents/create-team actually provisions anyone."""
-    client = deepseek_client_for_workspace(conn, workspace_id)
-    request = LlmChatRequest(
-        company_name="团队编译器",
-        conversation_title="团队编译",
-        agent=LlmChatAgent(
-            id="_team_compiler",
-            name="团队编译器",
-            role="团队编译助手",
-            prompt="（由 system_prompt_override 提供，此字段不会被使用）",
-        ),
-        messages=[LlmChatMessage(role="user", content=payload.description)],
-    )
+    operator = conn.execute(
+        """SELECT agents.id, conversations.id AS conversation_id
+        FROM agents
+        JOIN agent_specs ON agent_specs.agent_id = agents.id
+        LEFT JOIN conversations ON conversations.agent_id = agents.id
+          AND conversations.workspace_id = agents.workspace_id
+          AND conversations.kind = 'dm'
+        WHERE agents.workspace_id = ? AND agents.source = 'system_secretary'
+        ORDER BY conversations.created_at LIMIT 1""",
+        (workspace_id,),
+    ).fetchone()
+    if operator is None:
+        raise HTTPException(status_code=503, detail="团队编译器 Hermes 员工尚未就绪")
     try:
-        response = await client.complete(
-            request, system_prompt_override=build_team_draft_prompt()
+        draft_text = await run_hermes_control(
+            conn,
+            workspace_id=workspace_id,
+            agent_id=operator["id"],
+            conversation_id=operator["conversation_id"],
+            prompt=(
+                build_team_draft_prompt()
+                + "\n\n老板给出的团队需求：\n"
+                + payload.description
+                + "\n\n只输出符合上述约束的 JSON。"
+            ),
+            purpose="team-draft",
         )
-    except DeepSeekNotConfigured as exc:
-        raise HTTPException(status_code=503, detail=str(exc)) from exc
-    except DeepSeekAPIError as exc:
+    except HermesControlUnavailable as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
     try:
-        members = parse_team_draft(response.reply, source_request=payload.description)
+        members = parse_team_draft(draft_text, source_request=payload.description)
     except TeamDraftError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 

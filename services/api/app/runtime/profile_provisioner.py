@@ -371,8 +371,8 @@ class LocalHermesProvisioner:
         # reads `approvals.timeout` — that config key only feeds the
         # CLI-interactive prompt (tools/approval.py::prompt_dangerous_approval).
         # Writing it here would be a dead config write. The real fix lives on
-        # our side: `settings.approval_bridge_timeout_seconds` in
-        # `approval_bridge.await_decision`, kept comfortably under 60s so we
+        # our side: `settings.approval_bridge_timeout_seconds` in the durable
+        # database polling resolver, kept comfortably under 60s so we
         # always resolve before Hermes's hardcoded timeout would.
         effective_toolsets = set(toolsets)
         if self.hosted_safe_mode:

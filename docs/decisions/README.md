@@ -50,3 +50,6 @@
 - [0013](0013-company-world-model-and-cognitive-memory.md) — 公司事件账本 + 独立员工记忆 + 每 Run 上下文检索
 - [0014](0014-local-hermes-and-runtime-guards.md) — 本机 Hermes 执行、设备/项目绑定与真实性运行时守卫
 - [0015](0015-bundled-local-hermes-runtime.md) — 桌面安装包内置 Hermes runtime、Local Worker 与短期设备运行凭证
+- [0016](0016-hermes-only-employee-execution.md) — Hermes 是唯一员工与控制执行入口；模型供应商不得成为 API 直连聊天运行时
+- [0017](0017-resource-aware-workforce-scheduler.md) — 资源感知百人员工调度；取代固定并发 2 与最多两次调整限制
+- [0018](0018-boss-explicit-local-path-authorization.md) — 老板在桌面消息中明确给出的真实本机路径自动绑定当前 Worker；危险动作审批保持不变

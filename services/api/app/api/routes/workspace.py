@@ -9,7 +9,7 @@ from app.api.deps import get_current_user
 from app.core.config import settings
 from app.core.logging import get_logger
 from app.core.database import Database, Row, connect, get_db
-from app.runtime.deepseek import DeepSeekAPIError, DeepSeekChatClient, DeepSeekNotConfigured
+from app.runtime.hermes_control import run_hermes_control
 from app.runtime.hermes_client import HermesBackend, RunContext
 from app.runtime.runner import (
     make_bridge_resolver,
@@ -19,16 +19,7 @@ from app.runtime.runner import (
 from app.runtime.runs import RunStatus, create_run
 from app.runtime.profile_provisioner import build_provisioner_from_settings
 from app.runtime.reflection import run_reflection
-from app.schemas.run import (
-    LlmAgentExperience,
-    LlmChatAgent,
-    LlmChatMessage,
-    LlmChatRequest,
-    LlmKnowledgeSource,
-    LlmTaskContext,
-    RunOut,
-    RunStepOut,
-)
+from app.schemas.run import RunOut, RunStepOut
 from app.schemas.workspace import (
     AddConversationMembersRequest,
     BootstrapResponse,
@@ -61,10 +52,8 @@ from app.services.workspace import (
     create_knowledge_source,
     create_task,
     ensure_department,
-    extract_recruit_intent,
     get_bootstrap,
     get_workspace_for_user,
-    load_knowledge_context,
     new_id,
     now_iso,
     recruit_from_template,
@@ -75,11 +64,10 @@ from app.services.workspace import (
     serialize_task,
     sync_obsidian_documents,
     update_task,
+    provision_new_agent,
 )
 from app.services.credentials import delete_credential, put_credential
-from app.services.model_credentials import deepseek_client_for_workspace
-from app.orchestration.supply import create_agent_spec, provision, ProvisioningError
-from app.tools.function_loop import run_function_loop
+from app.orchestration.supply import ProvisioningError, provision
 from app.orchestration.brief import create_brief
 from app.orchestration.discussion import (
     run_discussion_round,
@@ -177,22 +165,33 @@ def create_custom_agent(
 
     result = serialize_agent(agent)
 
-    # If role_spec provided, create agent_spec + provision
-    if payload.role_spec:
-        try:
-            spec = create_agent_spec(
-                conn,
-                agent_id=agent_id,
-                workspace_id=workspace["id"],
-                role_name=payload.role_spec.role_name,
-                source_request=payload.role_spec.source_request,
-                responsibilities=payload.role_spec.responsibilities,
-                capability_keys=payload.role_spec.capability_keys,
-            )
-            spec = provision(conn, agent_id)
+    # Every recruitment route funnels through the same provisioning service.
+    # With server provisioning disabled this is a no-op; the Local Worker can
+    # still materialize its secret-free profile manifest on the owner device.
+    role_name = payload.role_spec.role_name if payload.role_spec else agent["role"]
+    source_request = (
+        payload.role_spec.source_request
+        if payload.role_spec
+        else "老板从员工管理页创建"
+    )
+    responsibilities = payload.role_spec.responsibilities if payload.role_spec else []
+    capability_keys = payload.role_spec.capability_keys if payload.role_spec else []
+    try:
+        spec = provision_new_agent(
+            conn,
+            agent_id=agent_id,
+            workspace_id=workspace["id"],
+            role_name=role_name,
+            source_request=source_request,
+            responsibilities=responsibilities,
+            capability_keys=capability_keys,
+            provision_now=payload.role_spec is not None,
+            full_capability_spec=payload.role_spec is not None,
+        )
+        if spec:
             result["spec"] = spec
-        except (ValueError, ProvisioningError) as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except (ValueError, ProvisioningError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     return result
 
@@ -349,12 +348,8 @@ async def reflect_agent(
     memory_reflection = reflect_agent_memories(
         conn, workspace_id=workspace["id"], agent_id=agent_id
     )
-    spec = conn.execute(
-        "SELECT status, hermes_profile FROM agent_specs WHERE agent_id = ?",
-        (agent_id,),
-    ).fetchone()
     names = []
-    if spec is not None and spec["status"] == "ready" and spec["hermes_profile"]:
+    if resolve_hermes_profile(conn, agent_id):
         names = await run_reflection(
             conn,
             agent_id=agent_id,
@@ -842,10 +837,12 @@ async def send_message(
         redact_local_paths,
         requires_local_execution,
     )
+    from app.services.local_runtime_profiles import profile_manifest_for_agent
 
     local_request = payload.execution_target == "local_desktop" or requires_local_execution(
         payload.content
     )
+    stored_content = redact_local_paths(payload.content)
     if local_request:
         device = online_device(conn, workspace["id"])
         project_id = payload.local_project_id
@@ -877,7 +874,7 @@ async def send_message(
                 conversation_id=conversation_id,
                 sender_type="user",
                 sender_id=current_user["id"],
-                content=payload.content,
+                content=stored_content,
             )
             blocked = add_message(
                 conn,
@@ -896,31 +893,32 @@ async def send_message(
                 "created_task": None,
                 "created_agent": None,
             }
+        user_message = add_message(
+            conn,
+            conversation_id=conversation_id,
+            sender_type="user",
+            sender_id=current_user["id"],
+            content=stored_content,
+        )
+        profile_manifest = profile_manifest_for_agent(
+            conn, workspace["id"], task_owner["id"]
+        )
         run_id = create_run(
             conn,
             workspace_id=workspace["id"],
             conversation_id=conversation_id,
             agent_id=task_owner["id"],
-            input_message_id=None,
-            hermes_profile_id=resolve_hermes_profile(conn, task_owner["id"]),
+            input_message_id=user_message["id"],
+            hermes_profile_id=(
+                profile_manifest["profile_name"] if profile_manifest else None
+            ),
             provider="hermes",
             status=RunStatus.QUEUED,
             execution_target="local_desktop",
             device_id=device["id"],
             local_project_id=project["id"],
             runtime_status="queued",
-            prompt_text=redact_local_paths(payload.content),
-        )
-        user_message = add_message(
-            conn,
-            conversation_id=conversation_id,
-            sender_type="user",
-            sender_id=current_user["id"],
-            content=payload.content,
-        )
-        conn.execute(
-            "UPDATE runs SET input_message_id = ? WHERE id = ?",
-            (user_message["id"], run_id),
+            prompt_text=stored_content,
         )
         queued = add_message(
             conn,
@@ -945,46 +943,13 @@ async def send_message(
         conversation_id=conversation_id,
         sender_type="user",
         sender_id=current_user["id"],
-        content=payload.content,
+        content=stored_content,
     )
+    # Employee and task mutations are never inferred and performed by this
+    # route. A Hermes Run must explicitly call a company MCP tool, which
+    # validates ownership and leaves an execution receipt.
     created_task = None
     created_agent = None
-    recruit_intent = _recruit_intent_for_conversation(
-        conversation, reply_agents, payload.content
-    )
-    if recruit_intent is not None:
-        department = ensure_department(
-            conn, workspace["id"], recruit_intent["department_name"]
-        )
-        created_agent_id = create_agent(
-            conn,
-            workspace_id=workspace["id"],
-            department_id=department["id"],
-            name=recruit_intent["name"],
-            role=recruit_intent["role"],
-            description=recruit_intent["description"],
-            prompt=recruit_intent["prompt"],
-            skills=recruit_intent["skills"],
-            mcps=recruit_intent["mcps"],
-            source="chat_factory",
-        )
-        create_dm_conversation(conn, workspace["id"], created_agent_id)
-        created_agent = conn.execute(
-            "SELECT * FROM agents WHERE id = ?", (created_agent_id,)
-        ).fetchone()
-        add_message(
-            conn,
-            conversation_id=conversation_id,
-            sender_type="system",
-            sender_id="",
-            content=(
-                f"已创建员工：{created_agent['name']}，加入"
-                f"{recruit_intent['department_name']}。你可以在员工列表或私聊里继续配置他。"
-            ),
-        )
-    # NOTE: Auto-task creation from chat intent has been removed.
-    # Task creation now requires a confirmed consensus_brief (see ADR 0006).
-    created_task = None
     agent_messages = []
 
     # Group discussion orchestration: if group chat in 'discussing' state,
@@ -1023,7 +988,6 @@ async def send_message(
             if msg is not None:
                 yield {"type": "message", "message": msg}
 
-        error_exc: Exception | None = None
         brief_draft: dict | None = None
         async for event in run_discussion_round(
             conn,
@@ -1031,19 +995,18 @@ async def send_message(
             conversation_id=conversation_id,
             member_agents=reply_agents,
             turn_executor=turn_executor,
-            llm_complete=make_speaker_selector(conn, workspace["id"]),
+            llm_complete=make_hermes_moderator(
+                conn,
+                workspace=workspace,
+                conversation=conversation,
+                members=reply_agents,
+                input_message_id=user_message["id"],
+            ),
         ):
             if event["type"] == "message":
                 agent_messages.append(event["message"])
             elif event["type"] == "brief_draft":
                 brief_draft = event.get("draft")
-            elif event["type"] == "error":
-                error_exc = event.get("exc")
-
-        if isinstance(error_exc, DeepSeekNotConfigured):
-            raise HTTPException(status_code=503, detail=str(error_exc))
-        if isinstance(error_exc, DeepSeekAPIError):
-            raise HTTPException(status_code=502, detail=str(error_exc))
 
         # 讨论收敛 → 自动落 draft 共识 brief（BRIEF_CARD 系统消息并入响应）
         if brief_draft:
@@ -1057,23 +1020,18 @@ async def send_message(
             if card_message is not None:
                 agent_messages.append(card_message)
     else:
-        # DM or single-agent group: original behavior
+        # DM or single-agent group: each reply is a Hermes Run or an explicit block.
         for agent in reply_agents:
-            try:
-                agent_messages.append(
-                    await complete_agent_reply(
-                        conn,
-                        workspace=workspace,
-                        conversation=conversation,
-                        conversation_id=conversation_id,
-                        agent=agent,
-                        user_message=user_message,
-                    )
+            agent_messages.append(
+                await complete_agent_reply(
+                    conn,
+                    workspace=workspace,
+                    conversation=conversation,
+                    conversation_id=conversation_id,
+                    agent=agent,
+                    user_message=user_message,
                 )
-            except DeepSeekNotConfigured as exc:
-                raise HTTPException(status_code=503, detail=str(exc)) from exc
-            except DeepSeekAPIError as exc:
-                raise HTTPException(status_code=502, detail=str(exc)) from exc
+            )
 
     serialized_agent_messages = [
         serialize_message(message) for message in agent_messages
@@ -1124,10 +1082,12 @@ async def send_message_stream(
         redact_local_paths,
         requires_local_execution,
     )
+    from app.services.local_runtime_profiles import profile_manifest_for_agent
 
     local_request = payload.execution_target == "local_desktop" or requires_local_execution(
         payload.content
     )
+    stored_content = redact_local_paths(payload.content)
     if local_request:
         device = online_device(conn, workspace["id"])
         project_id = payload.local_project_id
@@ -1154,7 +1114,7 @@ async def send_message_stream(
                 conversation_id=conversation_id,
                 sender_type="user",
                 sender_id=current_user["id"],
-                content=payload.content,
+                content=stored_content,
             )
             blocked = add_message(
                 conn,
@@ -1193,26 +1153,27 @@ async def send_message_stream(
             conversation_id=conversation_id,
             sender_type="user",
             sender_id=current_user["id"],
-            content=payload.content,
+            content=stored_content,
+        )
+        profile_manifest = profile_manifest_for_agent(
+            conn, workspace["id"], reply_agents[0]["id"]
         )
         run_id = create_run(
             conn,
             workspace_id=workspace["id"],
             conversation_id=conversation_id,
             agent_id=reply_agents[0]["id"],
-            input_message_id=None,
-            hermes_profile_id=resolve_hermes_profile(conn, reply_agents[0]["id"]),
+            input_message_id=user_message["id"],
+            hermes_profile_id=(
+                profile_manifest["profile_name"] if profile_manifest else None
+            ),
             provider="hermes",
             status=RunStatus.QUEUED,
             execution_target="local_desktop",
             device_id=device["id"],
             local_project_id=project["id"],
             runtime_status="queued",
-            prompt_text=redact_local_paths(payload.content),
-        )
-        conn.execute(
-            "UPDATE runs SET input_message_id = ? WHERE id = ?",
-            (user_message["id"], run_id),
+            prompt_text=stored_content,
         )
         queued = add_message(
             conn,
@@ -1248,31 +1209,9 @@ async def send_message_stream(
         conversation_id=conversation_id,
         sender_type="user",
         sender_id=current_user["id"],
-        content=payload.content,
+        content=stored_content,
     )
     conn.commit()
-
-    # Handle recruit intent (same as non-streaming; 只在小秘私聊生效)
-    recruit_intent = _recruit_intent_for_conversation(
-        conversation, reply_agents, payload.content
-    )
-    if recruit_intent is not None:
-        department = ensure_department(
-            conn, workspace["id"], recruit_intent["department_name"]
-        )
-        create_agent(
-            conn,
-            workspace_id=workspace["id"],
-            department_id=department["id"],
-            name=recruit_intent["name"],
-            role=recruit_intent["role"],
-            description=recruit_intent["description"],
-            prompt=recruit_intent["prompt"],
-            skills=recruit_intent["skills"],
-            mcps=recruit_intent["mcps"],
-            source="chat_factory",
-        )
-        conn.commit()
 
     async def event_generator():
         # The `conn` dependency is closed by FastAPI the instant this route's
@@ -1326,7 +1265,13 @@ async def send_message_stream(
                 conversation_id=conversation_id,
                 member_agents=reply_agents,
                 turn_executor=turn_executor,
-                llm_complete=make_speaker_selector(conn, workspace["id"]),
+                llm_complete=make_hermes_moderator(
+                    conn,
+                    workspace=workspace,
+                    conversation=conversation,
+                    members=reply_agents,
+                    input_message_id=user_message["id"],
+                ),
             ):
                 etype = event["type"]
                 if etype == "speaker":
@@ -1376,7 +1321,7 @@ async def send_message_stream(
                     conn.commit()
                     yield f"event: system\ndata: {json.dumps(serialize_message(silence_message), ensure_ascii=False)}\n\n"
         else:
-            # DM or single-agent: stream the reply (Hermes or DeepSeek fallback).
+            # DM or single-agent: every reply is a Hermes Run or an explicit block.
             for agent in reply_agents:
                 yield f"event: speaking\ndata: {json.dumps({'agent_id': agent['id'], 'agent_name': agent['name'], 'agent_role': agent['role']}, ensure_ascii=False)}\n\n"
                 try:
@@ -1394,7 +1339,7 @@ async def send_message_stream(
                             yield f"event: done\ndata: {json.dumps(serialize_message(event['message']), ensure_ascii=False)}\n\n"
                         elif etype == "approval_required":
                             yield f"event: approval\ndata: {json.dumps(event.get('payload', {}), ensure_ascii=False)}\n\n"
-                except (DeepSeekNotConfigured, DeepSeekAPIError) as exc:
+                except Exception as exc:
                     yield f"event: error\ndata: {json.dumps({'detail': str(exc)}, ensure_ascii=False)}\n\n"
                     break
 
@@ -1535,6 +1480,24 @@ def resolve_approval(
         raise HTTPException(status_code=409, detail="该审批已超时自动拒绝，无法再操作")
     if approval["status"] != "pending":
         raise HTTPException(status_code=409, detail="确认请求已处理")
+
+    # Plan tasks complete only after TaskScheduler has verified the required
+    # output.  A legacy task-bound approval contains no run/output evidence,
+    # so accepting it here would recreate the bypass guarded in update_task().
+    if (
+        approval["run_id"] is None
+        and approval["task_id"]
+        and payload.status == "approved"
+    ):
+        planned_task = conn.execute(
+            "SELECT task_plan_id FROM tasks WHERE id = ? AND workspace_id = ?",
+            (approval["task_id"], workspace["id"]),
+        ).fetchone()
+        if planned_task and planned_task["task_plan_id"]:
+            raise HTTPException(
+                status_code=409,
+                detail="计划任务必须提交并校验交付物后才能完成",
+            )
 
     resolved_at = now_iso()
     decision = payload.status
@@ -1813,6 +1776,25 @@ def _build_hermes_prompt(
     return "\n\n".join(sections)
 
 
+def _local_execution_block_text(content: str) -> str | None:
+    """Keep direct server replies fail-closed for requests about local files.
+
+    The public chat routes queue these requests to the Local Worker before a
+    reply reaches this point.  Other callers, notably inbound webhooks, have
+    no trusted device/project binding, so they must receive this same explicit
+    block instead of a server-side Hermes reply.
+    """
+    from app.services.local_runtime import requires_local_execution
+
+    if not requires_local_execution(content):
+        return None
+    return (
+        "尚未执行：这个请求需要老板本机的授权项目。"
+        "请在桌面端选择项目目录并通过本机 Hermes Worker 发起；"
+        "系统没有读取文件、运行命令或创建替代员工。"
+    )
+
+
 async def _stream_hermes_reply(
     conn: Database,
     *,
@@ -1856,67 +1838,6 @@ async def _stream_hermes_reply(
         yield event
 
 
-async def _run_action_bridge_stream(
-    conn: Database,
-    *,
-    workspace: Row,
-    conversation: Row,
-    agent: Row,
-    user_message: Row,
-    discussion_context: str = "",
-) -> AsyncGenerator:
-    """Agent Action Bridge（流式）：function-calling loop。
-
-    逐段产出 chunk 事件，结尾把完整回复落库并产出 message 事件；
-    空产出则没有 message 事件（由调用方决定是否兜底）。
-    """
-    deepseek = deepseek_client_for_workspace(conn, workspace["id"])
-    history = load_llm_history(conn, conversation["id"])
-    related_tasks, knowledge_sources, agent_experiences = load_agent_llm_context(
-        conn,
-        workspace_id=workspace["id"],
-        conversation_id=conversation["id"],
-        agent_id=agent["id"],
-        query=user_message["content"],
-    )
-    context_manifest = _build_context_manifest(
-        conn,
-        workspace=workspace,
-        conversation=conversation,
-        agent=agent,
-        current_text=user_message["content"],
-        discussion_context=discussion_context,
-    )
-    tool_chunks: list[str] = []
-    async for ev in run_function_loop(
-        conn=conn,
-        workspace_id=workspace["id"],
-        workspace_name=workspace["name"],
-        agent=agent,
-        history=history,
-        user_message_content=user_message["content"],
-        deepseek_client=deepseek,
-        related_tasks=related_tasks,
-        knowledge_sources=knowledge_sources,
-        agent_experiences=agent_experiences,
-        cognitive_context=context_manifest["text"],
-    ):
-        yield ev
-        if ev["type"] == "chunk":
-            tool_chunks.append(ev["content"])
-    # Persist the final message
-    reply_text = "".join(tool_chunks).strip()
-    if reply_text and conversation["id"]:
-        msg = add_message(
-            conn, conversation_id=conversation["id"],
-            sender_type="agent", sender_id=agent["id"],
-            content=reply_text,
-            provider="deepseek", model=deepseek.model,
-        )
-        conn.commit()
-        yield {"type": "message", "message": msg}
-
-
 async def _stream_reply_events(
     conn: Database,
     *,
@@ -1927,56 +1848,15 @@ async def _stream_reply_events(
     discussion_context: str = "",
     allow_action_bridge: bool = True,
 ) -> AsyncGenerator:
-    """Produce an agent's reply as {type: chunk|message|...} events.
-
-    Routing order matters: an employee with a real, ready Hermes profile must
-    go straight to Hermes — that's the only path that can ever hit the
-    approval gate (ADR 0008) for dangerous actions. Previously this tried the
-    Agent Action Bridge (function_loop) FIRST for every employee regardless
-    of Hermes status; since function_loop always "succeeds" (it has its own
-    no-tool-needed conversational fallback), Hermes was never reached even
-    for employees explicitly granted real capabilities — the approval gate
-    was unreachable dead code in production. Verified live (2026-07-15):
-    an employee with a granted `run_tests` capability and a real ready
-    Hermes profile was still answering "I don't have file system access"
-    from the Agent Action Bridge fallback instead of running for real.
-
-    Employees without a Hermes profile keep using the Agent Action Bridge
-    (create_employee/create_task/etc.), then the temporary DeepSeek path.
-    Discussion turns pass ``allow_action_bridge=False`` so no participant can
-    mutate the company before a consensus brief is launched.
-
-    Outside discussion, the secretary (source == "system_secretary") tries the Agent
-    Action Bridge FIRST even when she has a ready Hermes profile — her core
-    job (create_employee/create_group/create_task) lives in the system tools
-    that only function_loop has; sending her straight to Hermes means she can
-    only ever *talk about* hiring instead of actually doing it. But a bridge
-    round that produced text WITHOUT calling any of those system tools isn't
-    evidence her job got done — it's just conversational filler (function_loop
-    always has a no-tool-needed fallback), and the request may well have been
-    a real task she now has real capabilities for. So only a bridge round
-    that actually invoked a tool short-circuits here; a tool-less bridge reply
-    (like a function_loop exception or empty output) still falls through to
-    her Hermes profile below, so granting her a capability isn't a no-op.
-    """
+    """Run every employee reply through Hermes ACP, or report a real block."""
+    del allow_action_bridge  # Retained in the call contract during migration.
     profile = resolve_hermes_profile(conn, agent["id"])
-    is_secretary = agent.get("source") == "system_secretary"
 
-    # A server-side Hermes profile cannot see the owner's computer. Stop local
-    # requests before the company Action Bridge gets a chance to invent a
-    # workaround employee or a successful-looking text response.
-    from app.services.local_runtime import (
-        local_runtime_online,
-        requires_local_execution,
-    )
-
-    if requires_local_execution(user_message["content"]) and not local_runtime_online(
-        conn, workspace["id"]
-    ):
-        blocked = (
-            "尚未执行：这个请求需要访问老板本机，但当前没有连接本机 Hermes Worker。"
-            "请先在桌面端授权项目目录并保持 Worker 在线；系统没有读取文件、运行命令或创建替代员工。"
-        )
+    # A server-side Hermes profile cannot see the owner's computer. Both the
+    # streaming route and webhook/non-streaming route must stop here rather
+    # than letting an ordinary server run invent an execution result.
+    blocked = _local_execution_block_text(user_message["content"])
+    if blocked:
         message = add_message(
             conn,
             conversation_id=conversation["id"],
@@ -1991,171 +1871,64 @@ async def _stream_reply_events(
         yield {"type": "message", "message": message}
         return
 
-    if profile and (not is_secretary or not allow_action_bridge):
-        async for event in _stream_hermes_reply(
+    if not profile:
+        blocked = "尚未执行：该员工的 Hermes profile 尚未就绪，系统不会直接调用模型代答。"
+        message = add_message(
             conn,
-            workspace=workspace,
-            conversation=conversation,
-            agent=agent,
-            user_message=user_message,
-            discussion_context=discussion_context,
-            profile=profile,
-        ):
-            yield event
+            conversation_id=conversation["id"],
+            sender_type="agent",
+            sender_id=agent["id"],
+            content=blocked,
+            provider="agentpulse",
+            model="",
+        )
+        conn.commit()
+        yield {"type": "chunk", "content": blocked}
+        yield {"type": "message", "message": message}
         return
 
-    if allow_action_bridge:
-        # ── Agent Action Bridge (streaming): try function loop ──
-        bridge_used_tool = False
-        bridge_failed = False
-        try:
-            async for ev in _run_action_bridge_stream(
-                conn,
-                workspace=workspace,
-                conversation=conversation,
-                agent=agent,
-                user_message=user_message,
-                discussion_context=discussion_context,
-            ):
-                if ev["type"] == "tool_call":
-                    bridge_used_tool = True
-                yield ev
-        except Exception as exc:
-            logger.warning("function_loop_failed", agent_id=agent["id"], error=str(exc))
-            bridge_failed = True
-        if not bridge_failed and not is_secretary:
-            # 普通员工保持原行为——function_loop 走完（哪怕空产出）也不回落。
-            return
-        if not bridge_failed and is_secretary and bridge_used_tool:
-            # 她的本职工作（招人/建任务等系统工具）真的被调用了，到此为止。
-            return
-
-        # 小秘私聊兜底：Bridge 没有真正调用系统工具时走 Hermes。
-        if profile:
-            async for event in _stream_hermes_reply(
-                conn,
-                workspace=workspace,
-                conversation=conversation,
-                agent=agent,
-                user_message=user_message,
-                discussion_context=discussion_context,
-                profile=profile,
-            ):
-                yield event
-            return
-
-    # Temporary DeepSeek execution layer (employees without a Hermes profile).
-    logger.info("agent_reply_via_deepseek", agent_id=agent["id"])
-    full_reply = ""
-    async for chunk_text in await _stream_agent_reply(
+    async for event in _stream_hermes_reply(
         conn,
         workspace=workspace,
         conversation=conversation,
-        conversation_id=conversation["id"],
         agent=agent,
         user_message=user_message,
         discussion_context=discussion_context,
+        profile=profile,
     ):
-        full_reply += chunk_text
-        yield {"type": "chunk", "content": chunk_text}
-    msg = add_message(
-        conn,
-        conversation_id=conversation["id"],
-        sender_type="agent",
-        sender_id=agent["id"],
-        content=full_reply,
-        provider="deepseek",
-        model=settings.deepseek_model,
-    )
-    conn.commit()
-    yield {"type": "message", "message": msg}
+        yield event
 
 
-async def _stream_agent_reply(
+def make_hermes_moderator(
     conn: Database,
     *,
     workspace: Row,
     conversation: Row,
-    conversation_id: str,
-    agent: Row,
-    user_message: Row,
-    discussion_context: str = "",
-) -> AsyncGenerator:
-    """Stream agent reply using DeepSeek streaming API.
-
-    Yields text chunks. The caller is responsible for collecting and persisting.
-    """
-    from collections.abc import AsyncGenerator as _AG
-
-    history = load_llm_history(conn, conversation_id)
-    latest_user_content = next(
-        (message.content for message in reversed(history) if message.role == "user"),
-        "",
+    members: list[Row],
+    input_message_id: str,
+):
+    """Inject a Hermes-backed moderator into discussion orchestration."""
+    moderator = next(
+        (member for member in members if resolve_hermes_profile(conn, member["id"])),
+        None,
     )
-    related_tasks, knowledge_sources, agent_experiences = load_agent_llm_context(
-        conn,
-        workspace_id=workspace["id"],
-        conversation_id=conversation_id,
-        agent_id=agent["id"],
-        query=latest_user_content,
-    )
-    context_manifest = _build_context_manifest(
-        conn,
-        workspace=workspace,
-        conversation=conversation,
-        agent=agent,
-        current_text=latest_user_content or user_message["content"],
-        discussion_context=discussion_context,
-    )
-
-    request = LlmChatRequest(
-        company_name=workspace["name"],
-        conversation_title=conversation_title(conversation, agent),
-        agent=LlmChatAgent(
-            id=agent["id"],
-            name=agent["name"],
-            role=agent["role"],
-            department=agent["department_name"],
-            prompt=agent["prompt"],
-            skills=json.loads(agent["skills_json"]),
-        ),
-        messages=history,
-        related_tasks=related_tasks,
-        knowledge_sources=knowledge_sources,
-        agent_experiences=agent_experiences,
-        discussion_context=discussion_context,
-        cognitive_context=context_manifest["text"],
-        context_manifest_id=context_manifest["id"],
-    )
-
-    return deepseek_client_for_workspace(conn, workspace["id"]).complete_stream(request)
-
-
-def make_speaker_selector(conn: Database, workspace_id: str):
-    """Build the moderator-LLM callback injected into run_discussion_round.
-
-    The same callback serves speaker selection, convergence, brief drafting,
-    and one repair attempt. Its user message must therefore stay neutral;
-    task-specific instructions belong entirely to the injected system prompt.
-    All selection logic (@mention priority, JSON parsing/validation,
-    round-robin fallback) lives in orchestration/discussion.py.
-    """
+    if moderator is None:
+        return None
 
     async def _complete(prompt: str) -> str:
-        completion = await deepseek_client_for_workspace(conn, workspace_id).complete(
-            LlmChatRequest(
-                agent=LlmChatAgent(
-                    id="system",
-                    name="主持人",
-                    role="讨论主持人",
-                    prompt=prompt,
-                ),
-                messages=[
-                    LlmChatMessage(role="user", content="请严格按照系统指令完成输出")
-                ],
-            )
+        return await run_hermes_control(
+            conn,
+            workspace_id=workspace["id"],
+            agent_id=moderator["id"],
+            conversation_id=conversation["id"],
+            input_message_id=input_message_id,
+            purpose="discussion-moderation",
+            prompt=(
+                "本次仅担任内部讨论协调者，不向群聊发送普通回复，也不执行外部动作。"
+                "严格按下面要求输出，不能补充解释。\n\n"
+                + prompt
+            ),
         )
-        return completion.reply
 
     return _complete
 
@@ -2272,15 +2045,23 @@ async def complete_agent_reply(
     discussion_context: str = "",
     use_tools: bool = True,
 ) -> Row:
-    # Same routing-order fix as _stream_reply_events: an employee with a real
-    # ready Hermes profile must go straight to Hermes, or the approval gate
-    # (ADR 0008) is unreachable for this (non-streaming) path too.
-    # Exception (also same as _stream_reply_events): the secretary tries the
-    # Agent Action Bridge FIRST even with a ready profile — her core job lives
-    # in the system tools only function_loop has.
+    """Produce a non-streaming employee reply through Hermes only."""
+    del use_tools  # Legacy call contract; tools now arrive through Hermes MCP.
+    local_block = _local_execution_block_text(user_message["content"])
+    if local_block:
+        message = add_message(
+            conn,
+            conversation_id=conversation_id,
+            sender_type="agent",
+            sender_id=agent["id"],
+            content=local_block,
+            provider="agentpulse",
+            model="",
+        )
+        conn.commit()
+        return message
     profile = resolve_hermes_profile(conn, agent["id"])
-    is_secretary = agent.get("source") == "system_secretary"
-    if profile and not is_secretary:
+    if profile:
         return await _complete_hermes_reply(
             conn,
             workspace=workspace,
@@ -2290,182 +2071,18 @@ async def complete_agent_reply(
             discussion_context=discussion_context,
             profile=profile,
         )
-
-    # ── Agent Action Bridge: function-calling loop ──
-    # When use_tools is True (default for DM), the agent can call tools to
-    # create employees, tasks, groups, etc. instead of just chatting.
-    history = load_llm_history(conn, conversation_id)
-
-    if use_tools:
-        deepseek = deepseek_client_for_workspace(conn, workspace["id"])
-        related_tasks, knowledge_sources, agent_experiences = load_agent_llm_context(
-            conn,
-            workspace_id=workspace["id"],
-            conversation_id=conversation_id,
-            agent_id=agent["id"],
-            query=user_message["content"],
-        )
-        context_manifest = _build_context_manifest(
-            conn,
-            workspace=workspace,
-            conversation=conversation,
-            agent=agent,
-            current_text=user_message["content"],
-        )
-        try:
-            tool_chunks: list[str] = []
-            async for ev in run_function_loop(
-                conn=conn,
-                workspace_id=workspace["id"],
-                workspace_name=workspace["name"],
-                agent=agent,
-                history=history,
-                user_message_content=user_message["content"],
-                deepseek_client=deepseek,
-                related_tasks=related_tasks,
-                knowledge_sources=knowledge_sources,
-                agent_experiences=agent_experiences,
-                cognitive_context=context_manifest["text"],
-            ):
-                if ev["type"] == "chunk":
-                    tool_chunks.append(ev["content"])
-            reply_text = "".join(tool_chunks).strip()
-            if reply_text:
-                agent_message = add_message(
-                    conn, conversation_id=conversation_id,
-                    sender_type="agent", sender_id=agent["id"],
-                    content=reply_text,
-                    provider="deepseek", model=deepseek.model,
-                )
-                conn.commit()
-                return agent_message
-        except Exception as exc:
-            logger.warning("function_loop_failed", agent_id=agent["id"], error=str(exc))
-            # Fall through to Hermes (secretary) or normal completion
-
-    # 小秘兜底：Bridge 异常/空产出才轮到她的 Hermes profile
-    if profile and is_secretary:
-        return await _complete_hermes_reply(
-            conn,
-            workspace=workspace,
-            conversation_id=conversation_id,
-            agent=agent,
-            user_message=user_message,
-            discussion_context=discussion_context,
-            profile=profile,
-        )
-    latest_user_content = next(
-        (message.content for message in reversed(history) if message.role == "user"),
-        "",
-    )
-    related_tasks, knowledge_sources, agent_experiences = load_agent_llm_context(
-        conn,
-        workspace_id=workspace["id"],
-        conversation_id=conversation_id,
-        agent_id=agent["id"],
-        query=latest_user_content,
-    )
-    completion = await deepseek_client_for_workspace(conn, workspace["id"]).complete(
-        LlmChatRequest(
-            company_name=workspace["name"],
-            conversation_title=conversation_title(conversation, agent),
-            agent=LlmChatAgent(
-                id=agent["id"],
-                name=agent["name"],
-                role=agent["role"],
-                department=agent["department_name"],
-                prompt=agent["prompt"],
-                skills=json.loads(agent["skills_json"]),
-            ),
-            messages=history,
-            related_tasks=related_tasks,
-            knowledge_sources=knowledge_sources,
-            agent_experiences=agent_experiences,
-            discussion_context=discussion_context,
-        )
-    )
-
-    agent_message = add_message(
+    blocked = "尚未执行：该员工的 Hermes profile 尚未就绪，系统不会直接调用模型代答。"
+    message = add_message(
         conn,
         conversation_id=conversation_id,
         sender_type="agent",
         sender_id=agent["id"],
-        content=completion.reply,
-        provider=completion.provider,
-        model=completion.model,
+        content=blocked,
+        provider="agentpulse",
+        model="",
     )
-    run_id = new_id("run")
-    now = now_iso()
-    conn.execute(
-        """
-        INSERT INTO runs (
-          id, workspace_id, conversation_id, agent_id, status, input_message_id,
-          output_message_id, provider, model, usage_json, created_at, completed_at
-        )
-        VALUES (?, ?, ?, ?, 'completed', ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            run_id,
-            workspace["id"],
-            conversation_id,
-            agent["id"],
-            user_message["id"],
-            agent_message["id"],
-            completion.provider,
-            completion.model,
-            json.dumps(completion.usage or {}),
-            now,
-            now,
-        ),
-    )
-    related_task_rows = conn.execute(
-        """
-        SELECT id, title FROM tasks
-        WHERE workspace_id = ? AND conversation_id = ?
-        ORDER BY updated_at DESC
-        LIMIT 12
-        """,
-        (workspace["id"], conversation_id),
-    ).fetchall()
-    for task in related_task_rows:
-        add_task_event(
-            conn,
-            workspace_id=workspace["id"],
-            task_id=task["id"],
-            kind="agent_output_generated",
-            title=f"{agent['name']} 生成了产出",
-            content=completion.reply[:600],
-            conversation_id=conversation_id,
-            agent_id=agent["id"],
-        )
-        add_task_output(
-            conn,
-            workspace_id=workspace["id"],
-            task_id=task["id"],
-            title=f"{agent['name']} 的回复",
-            content=completion.reply,
-            conversation_id=conversation_id,
-            agent_id=agent["id"],
-        )
-    return agent_message
-
-
-def _recruit_intent_for_conversation(
-    conversation: Row,
-    reply_agents: list[Row],
-    content: str,
-) -> dict | None:
-    """招聘意图正则只在小秘的一对一私聊里生效。
-
-    群聊（或其他员工的 DM）里说"招个分析师"是在和团队讨论需求，不该被
-    正则截胡直接建一个无能力的纸片员工（source="chat_factory"）——真正的
-    招聘走小秘 DM 或团队编译器（ADR 0009）。
-    """
-    if conversation["kind"] != "dm":
-        return None
-    if not reply_agents or reply_agents[0].get("source") != "system_secretary":
-        return None
-    return extract_recruit_intent(content)
+    conn.commit()
+    return message
 
 
 def resolve_reply_agents(
@@ -2520,121 +2137,3 @@ def load_agent_for_reply(
         """,
         (agent_id, workspace_id),
     ).fetchone()
-
-
-def load_llm_history(
-    conn: Database, conversation_id: str
-) -> list[LlmChatMessage]:
-    rows = conn.execute(
-        """
-        SELECT messages.*, agents.name AS agent_name
-        FROM messages
-        LEFT JOIN agents ON agents.id = messages.sender_id
-        WHERE conversation_id = ? AND sender_type IN ('user', 'agent')
-        ORDER BY created_at DESC
-        LIMIT 12
-        """,
-        (conversation_id,),
-    ).fetchall()
-    messages = []
-    for row in reversed(rows):
-        messages.append(
-            LlmChatMessage(
-                role="user" if row["sender_type"] == "user" else "assistant",
-                name="老板" if row["sender_type"] == "user" else row["agent_name"],
-                content=row["content"],
-            )
-        )
-    return messages
-
-
-def load_related_task_context(conn: Database, conversation_id: str) -> list[dict]:
-    rows = conn.execute(
-        """
-        SELECT
-          tasks.id, tasks.title, tasks.description, tasks.priority,
-          tasks.status, tasks.progress, agents.name AS owner_name
-        FROM tasks
-        LEFT JOIN agents ON agents.id = tasks.owner_agent_id
-        WHERE tasks.conversation_id = ?
-        ORDER BY
-          CASE tasks.priority
-            WHEN 'P0' THEN 0
-            WHEN 'P1' THEN 1
-            ELSE 2
-          END,
-          tasks.updated_at DESC
-        LIMIT 12
-        """,
-        (conversation_id,),
-    ).fetchall()
-    return [
-        {
-            "id": row["id"],
-            "title": row["title"],
-            "description": row["description"],
-            "priority": row["priority"],
-            "status": row["status"],
-            "progress": row["progress"],
-            "owner_name": row["owner_name"],
-        }
-        for row in rows
-    ]
-
-
-def load_agent_experience_context(
-    conn: Database, agent_id: str
-) -> list[LlmAgentExperience]:
-    rows = conn.execute(
-        """
-        SELECT id, task_id, outcome, summary, lessons
-        FROM agent_experiences
-        WHERE agent_id = ?
-        ORDER BY created_at DESC
-        LIMIT 6
-        """,
-        (agent_id,),
-    ).fetchall()
-    return [
-        LlmAgentExperience(
-            id=row["id"],
-            task_id=row["task_id"],
-            outcome=row["outcome"],
-            summary=row["summary"],
-            lessons=row["lessons"],
-        )
-        for row in rows
-    ]
-
-
-def load_agent_llm_context(
-    conn: Database,
-    *,
-    workspace_id: str,
-    conversation_id: str,
-    agent_id: str,
-    query: str,
-) -> tuple[list[LlmTaskContext], list[LlmKnowledgeSource], list[LlmAgentExperience]]:
-    """Load the same company-knowledge / related-task / experience context
-    regardless of which reply path (Agent Action Bridge or plain DeepSeek
-    completion) ends up using it — keeps both in sync."""
-    related_tasks = [
-        LlmTaskContext(**row) for row in load_related_task_context(conn, conversation_id)
-    ]
-    knowledge_sources = [
-        LlmKnowledgeSource(
-            id=source["id"],
-            title=source["title"],
-            category=source["category"],
-            content=source["content"][:2000],
-        )
-        for source in load_knowledge_context(conn, workspace_id=workspace_id, query=query)
-    ]
-    agent_experiences = load_agent_experience_context(conn, agent_id)
-    return related_tasks, knowledge_sources, agent_experiences
-
-
-def conversation_title(conversation: Row, agent: Row) -> str:
-    if conversation["kind"] == "dm":
-        return f"私聊 · {agent['name']}"
-    return f"群聊 · {conversation['name']}"

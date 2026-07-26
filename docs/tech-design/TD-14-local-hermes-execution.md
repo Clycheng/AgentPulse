@@ -4,7 +4,7 @@
 
 用户在没有预装 Python、Hermes 或本机服务的 macOS Apple Silicon / Windows x64 电脑上安装 AgentPulse，登录并配置 DeepSeek Key 后，可以授权一个项目目录，让小秘真实读取、修改文件、运行命令和操作电脑。读取在授权范围内自动执行；写入、命令、浏览器登录和 computer use 必须等待数据库持久审批。每一步都要有 RunStep 和 `execution_receipt`，没有回执不得显示成功。
 
-当前开发版只验证了设备/项目/只读队列契约，仍会回退到开发机 PATH Hermes，因此不满足上述合同，也不得作为产品验收。
+当前开发版已验证固定 `runtime-stage` 中 Hermes ACP 的设备/项目/只读执行：小秘真实读取已授权项目 `README.md`，落入 execution receipt、完成 Run 并回写聊天。它仍未完成干净环境安装包、写入/命令审批、computer-use 和双平台 E2E，因此不满足完整产品合同。
 
 ## 设计
 
@@ -24,6 +24,15 @@
 | M2 | 登录/Key 后四人 profile 自动同步，本机 Hermes 真对话 | Key 不落 profile、日志或 renderer |
 | M3 | 小秘真实读项目、公司 MCP、写入/命令/computer-use 审批 | 回执、拒绝不执行、路径隔离和重启恢复均通过 |
 | M4 | macOS/Windows 包与 Release 资产可在干净环境安装 | 两个平台 runtime/包内检查/端到端证据齐全 |
+
+## 已验收切片（2026-07-25）
+
+- 员工聊天、控制 Run 和本机任务均经 Hermes ACP；旧 API 直连模型聊天固定返回 410。
+- Local Worker 默认使用固定 `runtime-stage`，不再默认调用系统 PATH 的 Hermes/Python；显式开发覆盖仅用于调试。
+- 已授权项目内读取 `README.md` 真实执行，`read_file/succeeded` 主 `execution_receipt`、RunStep、completed Run 和桌面最终消息一致；审计参数使用 `project://` 虚拟路径，不含本机绝对路径。
+- ACP 的标准 `session_update` 走 JSONL；同时保留同一 ACP 协议帧的去重兜底，防止子进程结束与最终消息通知竞争导致假失败。
+- 2026-07-25 边界审计后，流式、非流式和 webhook 回复在入库前脱敏 macOS/Windows 本机绝对路径并共用本机请求 fail-closed 规则；服务端与 Worker 文件访问都拒绝路径穿越和符号链接逃逸。计划任务的完成状态只能由已验证交付物的调度器写入，旧审批和通用任务更新入口不能绕过该门。
+- 2026-07-26 按 ADR 0018 接通老板消息中的显式路径授权：Electron 验证真实绝对路径后自动登记当前设备项目并随消息发送 `local_project_id`，无需再去设置页重复选择；Worker 启动改为幂等单飞。读取可直接执行，写入、命令和 `computer_use` 的持久审批不变。
 
 ## 关键不变量
 

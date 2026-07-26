@@ -13,6 +13,7 @@ import json
 
 from app.channels.adapters import ChannelMessage, get_adapter
 from app.core.database import Database, Row
+from app.services.local_runtime import redact_local_paths
 from app.services.workspace import new_id, now_iso
 
 
@@ -141,7 +142,7 @@ def _insert_external_message(
             message_id,
             conversation_id,
             msg.external_user_id,
-            msg.content,
+            redact_local_paths(msg.content),
             created_at,
             msg.external_message_id,
         ),

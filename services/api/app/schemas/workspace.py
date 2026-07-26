@@ -69,6 +69,12 @@ class TaskOut(BaseModel):
     plan_item_key: str | None = None
     expected_output: str = ""
     output_type: str = "markdown"
+    workflow_status: str = "queued"
+    waiting_reason: str = ""
+    story_points: int = 3
+    priority_score: float = 0
+    review_required: bool = False
+    risk_level: str = "low"
     created_at: str
     updated_at: str
 

@@ -49,7 +49,7 @@ Monorepo：`apps/`(web/desktop/admin，desktop 是主原型 Electron+React)、`s
 ### 明确不做（DON'T — 防止后续 AI 跑偏）
 - ❌ **不**以 Codex / Claude Code 这类"操作文件的工程师型" CLI 为基座。基座只用 Hermes。
 - ❌ **不**自建 Agent 协议 / Runtime / 工具系统(用 Hermes 的)。
-- ❌ **不**把现在 `services/api` 里"直连 DeepSeek 回一段话"那套当成目标形态——**那只是临时执行层**，最终由"后端调 Hermes profile"替换。
+- ❌ **不**直连 DeepSeek（或任何模型供应商）生成员工/控制回复。所有这类工作只能走 Hermes ACP Run；DeepSeek 仅可作为 Hermes 内部可替换的模型供应商，见 ADR 0016。
 - ⚠️ [ROADMAP.md](ROADMAP.md) 是早期文档，其中"多 CLI 适配 / 先 Codex 后 Claude"等 Runtime 取舍**已被本决策取代**，勿照搬；产品愿景和数据模型草案部分仍有效。
 
 ---
@@ -69,13 +69,14 @@ Monorepo：`apps/`(web/desktop/admin，desktop 是主原型 Electron+React)、`s
 
 | 模块 | 现状 | 目标 |
 |---|---|---|
-| `services/api` | FastAPI + PostgreSQL/SQLite；群讨论、brief、持久 Run 调度、Hermes ACP、TD-10 业务动作与 TD-13 公司事件/记忆/Context Engine 均已接入；TD-12 workspace BYOK、限流、生产安全和 ARM64 镜像已实现 | 完成 Oracle/Supabase 线上部署后按看板进入 TD-09 |
-| `apps/desktop` | 聊天/员工/任务/审批/brief/自动计划/内容包、业务凭证/渠道/动作审计、DeepSeek BYOK、TD-13 记忆证据审计和受控 Obsidian managed 同步 UI；生产 `app://`、固定 API 与 safeStorage 已接入 | 完成 macOS/Windows v0.1.0 发布后继续渐进拆分单文件原型 |
+| `services/api` | FastAPI + PostgreSQL/SQLite；群讨论、brief、Hermes ACP、TD-10/13 均已接入；TD-15 已实现 WorkRequest、百人员工资源调度、类型依赖、抢占恢复、独立协调和 workforce SSE | 完成 TD-15 真实 Hermes/多设备发布验收，并继续 TD-12 线上部署 |
+| `apps/desktop` | 既有聊天/员工/任务/审批/记忆/BYOK UI；TD-15 增加公司运行总览、员工工作台和本机资源进程池/Git worktree/ACP 安全暂停 | 完成 macOS/Windows 安装包与 1-30 执行槽真机验收 |
 | 群讨论协议 | 🟢 讨论态状态机、多 agent 发言路由、共识 brief 和 Task 门控均已实现；TD-11 已真实跑通 UI 中的“四人讨论→带分工 brief→一次确认” | 后续增强长讨论与衍生 brief 体验 |
 | Hermes 集成 | 🟢 ACP 真执行、技术危险动作审批、TD-11 公司工具和 TD-10 业务工具均已接入。业务工具使用独立 per-Run token；审批和外部动作持久化，Hermes 不持有 provider 密钥。Resend 邮件是真 provider，其余五类工具未配置时明确失败，不伪造执行 | 后续 provider 按 TD-09/新 ADR 逐项接入 |
-| 真实能力执行 / 本机 Hermes | 🟡 TD-14R-P1 已有 DSML/工具回执、device/project/Run lease 和开发版只读 Worker；**当前包仍依赖开发机 PATH Hermes，不得当作开箱即用产品验收** | 安装包固定 Hermes runtime/profile 同步、ACP Local Worker、审批型本机写入/命令/computer_use、macOS/Windows 真机重启 E2E |
+| 真实能力执行 / 本机 Hermes | 🟡 TD-14R-P1 已有 Hermes-only 入口、device/project/Run lease、真实 README 读取、工具回执和桌面消息回传；老板在桌面消息中明确给出的真实本机路径会自动绑定当前幂等 Worker（ADR 0018）；开发默认固定 `runtime-stage`，不回退系统 PATH。**完整安装包验收仍未完成** | 安装包固定 Hermes runtime/profile 同步、审批型本机写入/命令/computer_use、macOS/Windows 真机重启 E2E |
 | 自然语言捏 agent（北极星③） | 🟢 **第一版已实现并真机验证**：`POST /agents/draft-team`(一段话→可编辑草稿，复用 TD-04-T3 一直未接生产入口的 `draft_role_spec`) + `POST /agents/create-team`(确认后一次性真建员工+自动拉一个团队群)；`provision_new_agent` 统一四条招聘路径(人才市场/秘书 bootstrap/小秘 `create_employee`/团队编译器)的供给入口；桌面端 `TeamCompilerModal`。见 [ADR 0009](docs/decisions/0009-natural-language-team-compiler.md)。四点边界（不规划多群/不编业务技能/不加校验器/不做试运行）已拍板写死在 ADR，避免下一个 AI 又加回去 | 精细协作 SOP（如"机动备援"式动态支援角色）留给老板在群里/资料库后续补充，不在编译器范围 |
 | 自动执行闭环 | 🟢 TD-11 已实现一次 launch、依赖接力、重启恢复和 `content_package_v1`；TD-10 已增加持久业务动作、长期策略与真实邮件能力；TD-13 已接入共享事件账本、独立记忆、每 Run Context Manifest 和有界内部协作 | TD-09 负责渠道出站和更多渠道适配 |
+| 百人员工调度 | 🔵 TD-15 代码闭环：100×10 队列、动态槽、员工单前台、WorkRequest、四类依赖、协调 Agent、同 session 抢占恢复、本机批量 claim 与工作台 | 真实 Hermes 请求打断、多设备/双平台与 1-30 槽真机发布验收 |
 | 云端分发 | 🔵 TD-12 进行中：Vercel 官网/Analytics、公开 Releases 仓、BYOK、生产安全、ARM64 镜像和桌面打包链路已实现 | 完成 Supabase、Oracle、DNS、v0.1.0 Release 与线上 E2E |
 | 公司世界模型 | 🔵 TD-13 代码与 SQLite/API/UI 已接入：公司事件账本、证据记忆、Context Engine、MCP 同事协作、反思 worker 和受控 Obsidian managed 同步；真实 Hermes 四人认知 E2E 待线上/真实运行时验证 | 继续补长讨论、深度反思和四人跨经历 E2E |
 

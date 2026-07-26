@@ -19,6 +19,7 @@ import json
 
 from app.core.database import Database
 from app.orchestration.capability_catalog import resolve_bundle
+from app.runtime.runner import resolve_hermes_profile
 from app.services.workspace import new_id, now_iso
 
 
@@ -27,10 +28,7 @@ class UpgradeError(ValueError):
 
 
 def _agent_profile(conn: Database, agent_id: str) -> str | None:
-    row = conn.execute(
-        "SELECT hermes_profile FROM agent_specs WHERE agent_id = ?", (agent_id,)
-    ).fetchone()
-    return row["hermes_profile"] if row and row["hermes_profile"] else None
+    return resolve_hermes_profile(conn, agent_id)
 
 
 def _upsert_capability(

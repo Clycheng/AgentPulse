@@ -24,6 +24,8 @@ contextBridge.exposeInMainWorld('agentpulse', {
     start: () => ipcRenderer.invoke('agentpulse:local-runtime:start'),
     status: () => ipcRenderer.invoke('agentpulse:local-runtime:status'),
     pickProject: () => ipcRenderer.invoke('agentpulse:local-project:pick'),
+    authorizeMessageProject: (text: string) =>
+      ipcRenderer.invoke('agentpulse:local-project:authorize-message', text),
   },
   obsidian: {
     pickManaged: (): Promise<{

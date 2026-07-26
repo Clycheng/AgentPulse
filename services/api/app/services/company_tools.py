@@ -35,6 +35,29 @@ def _resolve_colleague_name(conn: Database, workspace_id: str, name: str) -> dic
 
 
 def authorize_run(conn: Database, claims: dict) -> dict:
+    if claims.get("run_kind") in {"chat", "triage", "idle", "coordination"}:
+        row = conn.execute(
+            """SELECT * FROM runs
+            WHERE id = ? AND task_id IS NULL""",
+            (claims["run_id"],),
+        ).fetchone()
+        if row is None:
+            raise CompanyToolError("run is not an active chat run")
+        expected = {
+            "workspace_id": row["workspace_id"],
+            "conversation_id": row["conversation_id"],
+            "run_id": row["id"],
+            "agent_id": row["agent_id"],
+        }
+        if any(claims.get(key) != value for key, value in expected.items()):
+            raise CompanyToolError("company tool token does not match chat run ownership")
+        if row["status"] not in (
+            "running", "pausing", "waiting_user", "waiting_clarify",
+            "waiting_information", "waiting_colleague",
+        ):
+            raise CompanyToolError("run is not active")
+        return dict(row)
+
     row = conn.execute(
         """SELECT r.*, t.task_plan_id, t.owner_agent_id, t.workspace_id AS task_workspace_id,
         t.conversation_id, t.status AS task_status, t.output_type
@@ -55,9 +78,20 @@ def authorize_run(conn: Database, claims: dict) -> dict:
         raise CompanyToolError("company tool token does not match run ownership")
     if row["owner_agent_id"] != claims["agent_id"]:
         raise CompanyToolError("only the current task owner may use company tools")
-    if row["status"] not in ("running", "waiting_user", "waiting_clarify"):
+    if row["status"] not in (
+        "running", "pausing", "waiting_user", "waiting_clarify",
+        "waiting_approval", "waiting_information", "waiting_colleague",
+    ):
         raise CompanyToolError("run is not active")
     return dict(row)
+
+
+def require_task_run(conn: Database, claims: dict) -> dict:
+    """Reject plan-mutating tools from a free-form conversation Run."""
+    # Older service tests omit run_kind; a present non-task scope is rejected.
+    if claims.get("run_kind") not in (None, "task", "review"):
+        raise CompanyToolError("该操作必须在已确认 brief 的任务 Run 中执行")
+    return authorize_run(conn, claims)
 
 
 def search_company_knowledge(
@@ -152,7 +186,112 @@ def ping_colleague_by_name(
         to_agent_id=colleague["id"],
         content=content,
     )
-    return {"ok": True, "delivered_to": colleague["name"], "message_id": result["message_id"]}
+    return {
+        "ok": True,
+        "delivered_to": colleague["name"],
+        "message_id": result["message_id"],
+        "work_request_id": result.get("work_request_id"),
+        "delivery_status": "delivered",
+    }
+
+
+def get_my_workbench(conn: Database, claims: dict) -> dict:
+    authorize_run(conn, claims)
+    from app.services.workforce import get_agent_workbench
+
+    return get_agent_workbench(
+        conn,
+        workspace_id=claims["workspace_id"],
+        agent_id=claims["agent_id"],
+    )
+
+
+def decide_my_work_request(
+    conn: Database,
+    claims: dict,
+    *,
+    request_id: str,
+    decision: str,
+    response_content: str,
+    decision_reason: str = "",
+    title: str | None = None,
+    expected_output: str = "",
+    output_type: str = "markdown",
+    story_points: int | None = None,
+    business_value: int = 3,
+    urgency: int = 2,
+    unblock_score: int = 0,
+    risk_reduction: int = 0,
+    switching_cost: float = 0,
+    risk_level: str = "low",
+    review_required: bool = False,
+) -> dict:
+    run = authorize_run(conn, claims)
+    if claims.get("run_kind") != "triage":
+        raise CompanyToolError("仅工作请求评估 Run 可以调用此工具")
+    request = conn.execute(
+        "SELECT * FROM work_requests WHERE id = ?", (request_id,)
+    ).fetchone()
+    if (
+        request is None
+        or request["target_agent_id"] != claims["agent_id"]
+        or request.get("triage_run_id") != run["id"]
+    ):
+        raise CompanyToolError("工作请求不属于当前评估 Run")
+    from app.services.workforce import WorkforceError, decide_work_request
+
+    try:
+        return decide_work_request(
+            conn,
+            workspace_id=claims["workspace_id"],
+            request_id=request_id,
+            target_agent_id=claims["agent_id"],
+            payload={
+                "decision": decision,
+                "response_content": response_content,
+                "decision_reason": decision_reason,
+                "title": title,
+                "expected_output": expected_output,
+                "output_type": output_type,
+                "story_points": story_points,
+                "business_value": business_value,
+                "urgency": urgency,
+                "unblock_score": unblock_score,
+                "risk_reduction": risk_reduction,
+                "switching_cost": switching_cost,
+                "risk_level": risk_level,
+                "review_required": review_required,
+            },
+        )
+    except WorkforceError as exc:
+        raise CompanyToolError(str(exc)) from exc
+
+
+def decide_my_coordination_case(
+    conn: Database,
+    claims: dict,
+    *,
+    case_id: str,
+    decision: str,
+    reason: str,
+) -> dict:
+    run = authorize_run(conn, claims)
+    if claims.get("run_kind") != "coordination":
+        raise CompanyToolError("仅独立协调 Hermes Run 可以提交协调结论")
+    from app.services.workforce import WorkforceError, decide_coordination_case
+
+    try:
+        return decide_coordination_case(
+            conn,
+            workspace_id=claims["workspace_id"],
+            case_id=case_id,
+            coordinator_agent_id=claims["agent_id"],
+            run_id=run["id"],
+            decision=decision,
+            reason=reason,
+        )
+    except WorkforceError as exc:
+        raise CompanyToolError(str(exc)) from exc
 
 
 def record_observation(
@@ -288,6 +427,7 @@ def propose_internal_task(
     owner_agent_id: str,
     expected_output: str,
 ) -> dict:
+    require_task_run(conn, claims)
     _assert_colleague(conn, claims["workspace_id"], owner_agent_id)
     return create_subtask(
         conn,
@@ -369,7 +509,7 @@ def create_subtask_by_name(
 def report_progress(
     conn: Database, claims: dict, *, progress: int, summary: str
 ) -> dict:
-    run = authorize_run(conn, claims)
+    run = require_task_run(conn, claims)
     bounded = max(1, min(95, progress))
     conn.execute(
         "UPDATE tasks SET status = '进行中', progress = ?, updated_at = ? WHERE id = ?",
@@ -396,7 +536,7 @@ def submit_output(
     output_type: str,
     content: object,
 ) -> dict:
-    run = authorize_run(conn, claims)
+    run = require_task_run(conn, claims)
     if output_type != run["output_type"]:
         raise CompanyToolError(
             f"task requires output_type={run['output_type']}, got {output_type}"
@@ -480,7 +620,7 @@ def create_subtask(
     output_type: str = "markdown",
     depends_on_task_ids: list[str] | None = None,
 ) -> dict:
-    run = authorize_run(conn, claims)
+    run = require_task_run(conn, claims)
     plan = conn.execute(
         """SELECT p.*, b.participant_agent_ids_json, b.work_items_json
         FROM task_plans p JOIN consensus_briefs b ON b.id = p.brief_id
@@ -559,7 +699,7 @@ def request_support(
 
 
 def block_task(conn: Database, claims: dict, *, reason: str) -> dict:
-    run = authorize_run(conn, claims)
+    run = require_task_run(conn, claims)
     conn.execute(
         "UPDATE tasks SET status = '阻塞', updated_at = ? WHERE id = ?",
         (now_iso(), claims["task_id"]),

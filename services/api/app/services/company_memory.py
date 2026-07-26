@@ -844,10 +844,32 @@ def send_internal_ping(
         sender_id=from_agent_id,
         content=content,
     )
+    source_task_id = None
+    if run_id:
+        run = conn.execute("SELECT task_id FROM runs WHERE id = ?", (run_id,)).fetchone()
+        source_task_id = run["task_id"] if run else None
+    from app.services.workforce import create_work_request
+
+    work_request = create_work_request(
+        conn,
+        workspace_id=workspace_id,
+        requester_type="agent",
+        requester_id=from_agent_id,
+        target_agent_id=to_agent_id,
+        content=content,
+        conversation_id=conversation["id"],
+        source_message_id=message["id"],
+        source_task_id=source_task_id,
+    )
     if run_id:
         record_company_event(
             conn, workspace_id=workspace_id, event_type="ping", source_id=run_id,
             title="同事间发起协作", content=content, conversation_id=conversation["id"],
             actor_agent_id=from_agent_id, metadata={"to_agent_id": to_agent_id},
         )
-    return {"conversation_id": conversation["id"], "message_id": message["id"], "to_agent_id": to_agent_id}
+    return {
+        "conversation_id": conversation["id"],
+        "message_id": message["id"],
+        "work_request_id": work_request["id"],
+        "to_agent_id": to_agent_id,
+    }

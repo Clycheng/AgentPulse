@@ -10,7 +10,7 @@ from app.core.database import connect, init_db
 from app.main import app
 from app.orchestration.brief import confirm_brief, validate_work_items
 from app.services.task_plans import launch_brief
-from app.services.workspace import new_id, now_iso
+from app.services.workspace import new_id, now_iso, update_task
 
 
 def _items(agent_ids: list[str]) -> list[dict]:
@@ -112,6 +112,7 @@ def _client(tmp_path, monkeypatch):
         conn.commit()
     finally:
         conn.close()
+
     return client, registered, headers, agents, group
 
 
@@ -180,6 +181,56 @@ def test_launch_is_atomic_idempotent_and_exposes_plan_snapshot(tmp_path, monkeyp
     fetched_task = next(task for task in fetched.json()["tasks"] if task["id"] == active_task["id"])
     assert fetched_task["approvals"][0]["id"] == "approval-live"
 
+
+def test_planned_task_cannot_complete_without_scheduler_verified_output(tmp_path, monkeypatch):
+    client, registered, headers, agents, group = _client(tmp_path, monkeypatch)
+    brief = _create_brief(client, headers, agents, group)
+    plan = client.post(f"/api/briefs/{brief['id']}/launch", headers=headers).json()
+    task = next(item for item in plan["tasks"] if item["plan_item_key"] == "package")
+
+    conn = connect()
+    try:
+        with pytest.raises(ValueError, match="verified scheduler output"):
+            update_task(
+                conn,
+                workspace_id=registered["workspace"]["id"],
+                task_id=task["id"],
+                changes={"status": "已完成", "progress": 100},
+            )
+
+        approval_id = "approval-legacy-plan"
+        conn.execute(
+            """INSERT INTO approvals (
+              id, workspace_id, task_id, conversation_id, agent_id, title,
+              description, status, risk_level, type, created_at
+            ) VALUES (?, ?, ?, ?, ?, '旧式确认', '没有可验证交付物',
+              'pending', 'low', 'high_risk', ?)""",
+            (
+                approval_id,
+                registered["workspace"]["id"],
+                task["id"],
+                group["id"],
+                task["owner_agent_id"],
+                now_iso(),
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    rejected = client.post(
+        f"/api/approvals/{approval_id}/resolve",
+        headers=headers,
+        json={"status": "approved", "scope": "once"},
+    )
+    assert rejected.status_code == 409
+    conn = connect()
+    try:
+        assert conn.execute(
+            "SELECT status FROM approvals WHERE id = ?", (approval_id,)
+        ).fetchone()["status"] == "pending"
+    finally:
+        conn.close()
 
 def test_concurrent_launch_returns_one_plan(tmp_path, monkeypatch):
     client, registered, headers, agents, group = _client(tmp_path, monkeypatch)

@@ -11,10 +11,13 @@
     "dev:renderer": "vite --host 127.0.0.1 --port 5174",
     "build:electron": "tsc -p electron/tsconfig.json",
     "build": "tsc -b && vite build && tsc -p electron/tsconfig.json",
+    "prepare:runtime": "node scripts/build-hermes-runtime.mjs",
+    "verify:runtime": "node scripts/verify-hermes-runtime.mjs",
+    "test:local-project-path": "npm run build:electron && node scripts/test-local-project-path.mjs",
     "start": "electron .",
     "lint": "tsc --noEmit && tsc -p electron/tsconfig.json --noEmit",
-    "package:mac": "npm run build && electron-builder --mac",
-    "package:win": "npm run build && electron-builder --win",
+    "package:mac": "npm run build && npm run prepare:runtime -- --platform=darwin --arch=arm64 && npm run verify:runtime && electron-builder --mac",
+    "package:win": "npm run build && npm run prepare:runtime -- --platform=win32 --arch=x64 && npm run verify:runtime && electron-builder --win",
     "package:linux": "npm run build && electron-builder --linux"
   },
   "dependencies": {
@@ -47,6 +50,15 @@
       "output": "release",
       "buildResources": "resources"
     },
+    "extraResources": [
+      {
+        "from": "runtime-stage",
+        "to": "hermes-runtime",
+        "filter": [
+          "**/*"
+        ]
+      }
+    ],
     "mac": {
       "artifactName": "AgentPulse-mac-${arch}.${ext}",
       "icon": "resources/icon.icns",

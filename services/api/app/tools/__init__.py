@@ -1,7 +1,6 @@
-"""Agent action tools — the bridge between agent chat and AgentPulse operations.
+"""Canonical company-tool contracts and handlers for Hermes MCP Runs.
 
-Each tool is an OpenAI/DeepSeek function-calling schema + a Python handler
-that calls internal service functions directly (no HTTP). When an employee
-decides to call a tool, the handler executes it and returns structured results
-that feed back into the conversation.
+Each tool has one parameter contract and one internal service handler. Hermes
+receives these tools through the company MCP surface; it never relies on a
+provider-specific function-calling loop.
 """

@@ -1,27 +1,17 @@
-from fastapi import APIRouter, Depends, HTTPException
-
-from app.api.deps import get_workspace_id
-from app.core.database import Database, get_db
-from app.runtime.deepseek import (
-    DeepSeekChatClient,
-    DeepSeekAPIError,
-    DeepSeekNotConfigured,
-)
-from app.schemas.run import LlmChatRequest, LlmChatResponse
-from app.services.model_credentials import deepseek_client_for_workspace
+from fastapi import APIRouter, HTTPException
 
 router = APIRouter(prefix="/runs", tags=["runs"])
 
 
-@router.post("/llm-chat", response_model=LlmChatResponse)
-async def run_llm_chat(
-    payload: LlmChatRequest,
-    workspace_id: str = Depends(get_workspace_id),
-    conn: Database = Depends(get_db),
-) -> LlmChatResponse:
-    try:
-        return await deepseek_client_for_workspace(conn, workspace_id).complete(payload)
-    except DeepSeekNotConfigured as exc:
-        raise HTTPException(status_code=503, detail=str(exc)) from exc
-    except DeepSeekAPIError as exc:
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
+@router.post("/llm-chat", include_in_schema=False)
+async def retired_direct_llm_chat() -> None:
+    """Reject the temporary direct-provider endpoint.
+
+    All employee and control work is now a persisted Hermes ACP Run. Keeping a
+    visible 410 helps old desktop builds fail honestly instead of silently
+    bypassing profile, tool, approval, and receipt enforcement.
+    """
+    raise HTTPException(
+        status_code=410,
+        detail="直接模型聊天已停用；请通过 Hermes Run 执行员工工作。",
+    )

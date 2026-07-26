@@ -20,6 +20,7 @@ from app.api.routes.team_compiler import router as team_compiler_router
 from app.api.routes.task_plans import router as task_plans_router
 from app.api.routes.telemetry import router as telemetry_router
 from app.api.routes.webhooks import router as webhooks_router
+from app.api.routes.workforce import router as workforce_router
 from app.api.company_tools_mcp import company_tools_app, company_tools_lifespan
 from app.api.business_tools_mcp import business_tools_app, business_tools_lifespan
 from app.api.routes.business_tools import router as business_tools_router
@@ -91,15 +92,17 @@ def create_app() -> FastAPI:
     )
 
     app.add_middleware(
+        RequestSecurityMiddleware,
+        max_body_bytes=settings.max_request_body_bytes,
+    )
+    # Starlette applies the last added middleware outermost. Keep CORS outside
+    # the security middleware so browser clients can receive real API errors.
+    app.add_middleware(
         CORSMiddleware,
         allow_origins=settings.cors_origins,
         allow_credentials=False,
         allow_methods=["*"],
         allow_headers=["*"],
-    )
-    app.add_middleware(
-        RequestSecurityMiddleware,
-        max_body_bytes=settings.max_request_body_bytes,
     )
 
     app.include_router(health_router, prefix="/api")
@@ -118,6 +121,7 @@ def create_app() -> FastAPI:
     app.include_router(team_compiler_router, prefix="/api")
     app.include_router(task_plans_router, prefix="/api")
     app.include_router(business_tools_router, prefix="/api")
+    app.include_router(workforce_router, prefix="/api")
     app.include_router(webhooks_router)
     app.mount("/mcp/company-tools", company_tools_app)
     app.mount("/mcp/business-tools", business_tools_app)
@@ -138,8 +142,8 @@ def _check_hermes_binary_if_provisioning_enabled() -> None:
     first request) — same idea applied to our own "is the thing we depend on
     actually there" check. Without this, turning on
     AGENTPULSE_HERMES_PROVISIONING with a missing/misconfigured `hermes`
-    binary silently degrades every employee to the DeepSeek fallback until
-    someone notices runs never reach `ready`.
+    binary leaves employees unable to execute. The service blocks that Run;
+    it never changes the runtime to a direct model-provider response.
     """
     if not settings.hermes_provisioning:
         return
@@ -151,8 +155,7 @@ def _check_hermes_binary_if_provisioning_enabled() -> None:
             "hermes_binary_not_found",
             hermes_bin=settings.hermes_bin,
             hint="AGENTPULSE_HERMES_PROVISIONING=true but the `hermes` CLI "
-            "isn't on PATH — every employee will silently fall back to "
-            "DeepSeek instead of becoming real Hermes employees.",
+            "isn't on PATH — employees will be blocked until Hermes is ready.",
         )
         print(
             f"ERROR: AGENTPULSE_HERMES_PROVISIONING=true but "

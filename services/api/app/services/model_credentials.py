@@ -1,12 +1,9 @@
 from __future__ import annotations
 
-from typing import Any
-
 import httpx
 
 from app.core.config import settings
 from app.core.database import Database
-from app.runtime.deepseek import DeepSeekChatClient
 from app.services.credentials import CredentialError, decrypt_value, encrypt_value
 from app.services.workspace import new_id, now_iso
 
@@ -70,20 +67,6 @@ def runtime_model_environment(conn: Database, workspace_id: str) -> dict[str, st
             raise
         return {}
     return {"DEEPSEEK_API_KEY": key}
-
-
-def deepseek_client_for_workspace(
-    conn: Database, workspace_id: str
-) -> DeepSeekChatClient:
-    try:
-        key = get_workspace_model_api_key(conn, workspace_id)
-    except ModelCredentialRequired:
-        key = ""
-    row = _row(conn, workspace_id)
-    return DeepSeekChatClient(
-        api_key=key,
-        model=(row["model"] if row is not None else settings.deepseek_model),
-    )
 
 
 async def validate_deepseek_key(api_key: str) -> None:

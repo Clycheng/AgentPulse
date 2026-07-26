@@ -61,10 +61,14 @@ class Settings(BaseSettings):
     task_worker_poll_seconds: float = 2.0
     task_run_lease_seconds: int = 30
     task_run_heartbeat_seconds: int = 10
-    task_workspace_concurrency: int = 2
+    # TD-15: server capacity is resource-based. The legacy workspace value is
+    # parsed for one release so old environments still start, but is not used.
+    task_server_slots: int = 8
+    task_workspace_concurrency: int = 100
     company_tools_url: str = "http://127.0.0.1:8000/mcp/company-tools/"
     company_tool_token_ttl_seconds: int = 900
     local_device_token_ttl_seconds: int = 900
+    local_runtime_session_ttl_seconds: int = 90
     business_tools_url: str = "http://127.0.0.1:8000/mcp/business-tools/"
     business_tool_token_ttl_seconds: int = 900
     business_worker_enabled: bool = True

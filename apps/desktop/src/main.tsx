@@ -1,6 +1,7 @@
 import { Fragment, StrictMode, useEffect, useMemo, useRef, useState } from 'react';
 import type { ReactNode, RefObject } from 'react';
 import { createRoot } from 'react-dom/client';
+import type { Root } from 'react-dom/client';
 import { useTranslation } from 'react-i18next';
 import './i18n';
 import './styles.css';
@@ -11,9 +12,12 @@ import {
   ModelProviderSettings,
 } from './ModelProviderSettings';
 import type { ModelProviderStatus } from './ModelProviderSettings';
+import { AgentWorkbenchPanel } from './AgentWorkbenchPanel';
+import type { AgentWorkbench } from './AgentWorkbenchPanel';
 
 declare global {
   interface Window {
+    agentpulseReactRoot?: Root;
     agentpulse?: {
       platform: string;
       session: {
@@ -28,9 +32,15 @@ declare global {
           deviceId: string | null;
           hermes: string;
           projects: Array<{ id: string; displayName: string; allowedScopes: string[] }>;
+          profilesReady: boolean;
           lastError: string;
         }>;
         pickProject: () => Promise<{
+          id: string;
+          display_name: string;
+          path_hash: string;
+        } | null>;
+        authorizeMessageProject: (text: string) => Promise<{
           id: string;
           display_name: string;
           path_hash: string;
@@ -661,6 +671,31 @@ function dotColor(status: AgentStatus) {
   }[status];
 }
 
+function workforceActivityStatus(
+  activity: string | undefined,
+  fallbackKind: AgentStatus,
+  fallbackLabel: string,
+) {
+  if (!activity) return { kind: fallbackKind, label: fallbackLabel };
+  const labels: Record<string, string> = {
+    offline: '离线',
+    available: '可接新工作',
+    triaging: '评估请求',
+    focused: '专注执行',
+    waiting: '等待中',
+    blocked: '已阻塞',
+    degraded: '运行降级',
+  };
+  const kind: AgentStatus = activity === 'focused' || activity === 'triaging'
+    ? 'busy'
+    : activity === 'blocked'
+      ? 'stuck'
+      : activity === 'waiting' || activity === 'degraded'
+        ? 'wait'
+        : 'idle';
+  return { kind, label: labels[activity] ?? activity };
+}
+
 function priorityStyle(priority: Priority) {
   if (priority === 'P0') return { background: '#FEECEA', color: '#B42318' };
   if (priority === 'P1') return { background: '#FEF3E2', color: '#B45309' };
@@ -735,10 +770,6 @@ function progressForNextStatus(status: TaskStatus, current: number) {
   return current;
 }
 
-function authHeaders(token: string) {
-  return { Authorization: `Bearer ${token}` };
-}
-
 async function apiRequest<T>(
   path: string,
   options: RequestInit & { token?: string } = {},
@@ -758,6 +789,31 @@ async function apiRequest<T>(
     throw new Error(formatApiError(payload, response.status));
   }
   return payload as T;
+}
+
+function approvalCardText({
+  approvalId,
+  category,
+  title,
+  description,
+  payload = {},
+}: {
+  approvalId: string;
+  category?: string;
+  title?: string;
+  description?: string;
+  payload?: Record<string, unknown>;
+}) {
+  return (
+    'APPROVAL_CARD:' +
+    JSON.stringify({
+      ...payload,
+      approval_id: approvalId,
+      category: category || 'high_risk',
+      title,
+      description,
+    })
+  );
 }
 
 function formatApiError(payload: unknown, status: number) {
@@ -1092,6 +1148,7 @@ function App() {
   const modelProviderPrompted = useRef(false);
   const messagesRef = useRef<HTMLDivElement>(null);
   const toastTimer = useRef<number | undefined>(undefined);
+  const localRunRefreshes = useRef(new Set<string>());
 
   const showToast = (message: string) => {
     window.clearTimeout(toastTimer.current);
@@ -1358,15 +1415,13 @@ function App() {
               from: 'system',
               type: 'system',
               time: '',
-              text:
-                'APPROVAL_CARD:' +
-                JSON.stringify({
-                  approval_id: approval.id,
-                  category: approval.type,
-                  title: approval.title,
-                  description: approval.description,
-                  ...approval.payload,
-                }),
+              text: approvalCardText({
+                approvalId: approval.id,
+                category: approval.type,
+                title: approval.title,
+                description: approval.description,
+                payload: approval.payload,
+              }),
             }));
           return additions.length
             ? { ...current, [chatId]: [...messages, ...additions] }
@@ -1445,7 +1500,7 @@ function App() {
       );
       setModelProvider(status);
       setModelProviderOpen(false);
-      showToast('DeepSeek 已连接，AI 团队正在就位');
+      showToast('Hermes 运行模型已配置，团队正在就位');
       await loadBootstrap(token);
     } catch (error) {
       setModelProviderError(
@@ -1463,7 +1518,7 @@ function App() {
       { token, method: 'DELETE' },
     );
     setModelProvider(status);
-    showToast('DeepSeek Key 已撤销，新 Run 已停止');
+      showToast('Hermes 模型凭证已撤销，新 Run 已停止');
     await loadBootstrap(token);
   };
 
@@ -1558,6 +1613,34 @@ function App() {
     setTaskOpen(true);
   };
 
+  const refreshLocalRunOnCompletion = async (
+    runId: string,
+    conversationId: string,
+  ) => {
+    if (!token || localRunRefreshes.current.has(runId)) return;
+    localRunRefreshes.current.add(runId);
+    try {
+      for (let attempt = 0; attempt < 180; attempt += 1) {
+        await new Promise((resolve) => window.setTimeout(resolve, 1000));
+        const runs = await apiRequest<Array<{ id: string; status: string }>>(
+          `/conversations/${conversationId}/runs`,
+          { token },
+        );
+        const run = runs.find((candidate) => candidate.id === runId);
+        if (!run) return;
+        if (['completed', 'failed', 'waiting_user', 'waiting_clarify', 'cancelled'].includes(run.status)) {
+          await loadBootstrap(token);
+          return;
+        }
+      }
+    } catch {
+      // The workspace refresh on the next user action remains available after
+      // a transient local-run polling failure.
+    } finally {
+      localRunRefreshes.current.delete(runId);
+    }
+  };
+
   const send = async () => {
     const text = draft.trim();
     if (!text || !activeChat || !token) return;
@@ -1607,12 +1690,27 @@ function App() {
       const headers = new Headers();
       headers.set('Content-Type', 'application/json');
       headers.set('Authorization', `Bearer ${token}`);
+      // Employees always run through Hermes. Prefer the bundled local Worker
+      // whenever this desktop has an authorized project; the API never falls
+      // back to a direct model reply.
+      const messageProject = await window.agentpulse?.localRuntime.authorizeMessageProject(text);
+      const localRuntime = await window.agentpulse?.localRuntime.status();
+      const localProjectId = messageProject?.id ?? localRuntime?.projects[0]?.id ?? null;
+      const useLocalHermes = Boolean(localRuntime?.online && localProjectId);
       const sseResponse = await fetch(
         `${apiBaseUrl}/conversations/${targetChat.id}/messages/stream`,
         {
           method: 'POST',
           headers,
-          body: JSON.stringify({ content: text, target_agent_id: targetAgentId }),
+          body: JSON.stringify({
+            content: text,
+            target_agent_id: targetAgentId,
+            // The API validates the device and project again. A missing local
+            // runtime still goes to a server Hermes Run, never a direct model
+            // response.
+            local_project_id: localProjectId,
+            execution_target: useLocalHermes ? 'local_desktop' : 'server',
+          }),
         },
       );
       if (!sseResponse.ok) {
@@ -1672,6 +1770,13 @@ function App() {
                       : agent,
                   ),
                 );
+              } else if (currentEvent === 'status') {
+                if (
+                  data.execution_target === 'local_desktop' &&
+                  typeof data.run_id === 'string'
+                ) {
+                  void refreshLocalRunOnCompletion(data.run_id, targetChat.id);
+                }
               } else if (currentEvent === 'chunk') {
                 // Append chunk to streaming message
                 streamingContent += data.content;
@@ -1724,15 +1829,21 @@ function App() {
                     : category === 'capability_upgrade'
                       ? tool.capability_description || tool.text || ''
                       : tool.text || tool.title || '';
-                const cardText =
-                  'APPROVAL_CARD:' +
-                  JSON.stringify({
-                    approval_id: data.approval_id,
-                    category,
-                    title,
-                    description,
+                const cardText = approvalCardText({
+                  approvalId: data.approval_id,
+                  category,
+                  title,
+                  description,
+                  payload: {
+                    ...tool,
+                    ...(data.payload && typeof data.payload === 'object'
+                      ? data.payload
+                      : {}),
+                    preview: data.preview || tool.preview,
+                    risk_gate: data.risk_gate || tool.risk_gate,
                     suggested_capability_key: tool.suggested_capability_key,
-                  });
+                  },
+                });
                 setMessagesByChat((current) => ({
                   ...current,
                   [targetChat.id]: [
@@ -1784,7 +1895,7 @@ function App() {
       await loadBootstrap(token);
     } catch (error) {
       const errorMessage =
-        error instanceof Error ? error.message : 'LLM 调用失败，请稍后重试';
+        error instanceof Error ? error.message : 'Hermes Run 失败，请稍后重试';
       setMessagesByChat((current) => ({
         ...current,
         [targetChat.id]: [
@@ -1794,11 +1905,11 @@ function App() {
             from: 'system',
             type: 'system',
             time: '',
-            text: `真实调用 DeepSeek 失败：${errorMessage}`,
+            text: `Hermes Run 失败：${errorMessage}`,
           },
         ],
       }));
-      showToast('DeepSeek 调用失败，请检查后端和 API Key');
+      showToast('Hermes Run 失败，请检查本机运行时、员工 profile 和模型配置');
     } finally {
       setTypingName(null);
       setAgents((current) =>
@@ -2394,6 +2505,7 @@ function App() {
 
         {view === 'staff' && (
           <StaffView
+            token={token}
             companyName={workspace.name}
             departments={departments}
             agents={agents}
@@ -2697,8 +2809,10 @@ function LocalRuntimePanel() {
     online: boolean;
     hermes: string;
     projects: Array<{ id: string; displayName: string; allowedScopes: string[] }>;
+    profilesReady: boolean;
     lastError: string;
   } | null>(null);
+  const [actionError, setActionError] = useState('');
   const refresh = async () => {
     const current = await window.agentpulse?.localRuntime.status();
     if (current) setStatus(current);
@@ -2707,16 +2821,21 @@ function LocalRuntimePanel() {
     void refresh();
   }, []);
   const pickProject = async () => {
-    await window.agentpulse?.localRuntime.start();
-    await window.agentpulse?.localRuntime.pickProject();
-    await refresh();
+    setActionError('');
+    try {
+      await window.agentpulse?.localRuntime.start();
+      await window.agentpulse?.localRuntime.pickProject();
+      await refresh();
+    } catch (error) {
+      setActionError(error instanceof Error ? error.message : '授权项目目录失败。');
+    }
   };
   return (
     <section className="settings-panel" aria-label="本机执行">
       <div className="settings-panel-header">
         <div>
           <h2>本机 Hermes</h2>
-          <p>读取已授权项目；写入、命令和电脑控制仍需后续审批运行时。</p>
+          <p>内置 runtime 与员工 profile 已在本机同步。已授权项目可读取；写文件和终端命令每次都需确认。</p>
         </div>
         <span className={`status-pill ${status?.online ? 'ready' : 'offline'}`}>
           {status?.online ? '在线' : '未连接'}
@@ -2730,6 +2849,10 @@ function LocalRuntimePanel() {
         <span>授权项目</span>
         <span>{status?.projects.length ? `${status.projects.length} 个` : '暂无'}</span>
       </div>
+      <div className="settings-panel-row">
+        <span>员工 profile</span>
+        <span>{status?.profilesReady ? '已同步' : '待同步'}</span>
+      </div>
       <div className="settings-panel-actions">
         <button className="button secondary" type="button" onClick={() => void refresh()}>
           刷新状态
@@ -2738,7 +2861,9 @@ function LocalRuntimePanel() {
           授权项目目录
         </button>
       </div>
-      {status?.lastError && <p className="form-error">{status.lastError}</p>}
+      {(actionError || status?.lastError) && (
+        <p className="form-error">{actionError || status?.lastError}</p>
+      )}
     </section>
   );
 }
@@ -4430,8 +4555,9 @@ function MessageItem({
           <em>{message.time}</em>
           {message.provider && (
             <em className="model-badge">
-              {message.provider}
-              {message.model ? ` · ${message.model}` : ''}
+              {message.provider === 'deepseek'
+                ? '历史直接回复（已停用）'
+                : `Hermes ACP${message.model ? ` · ${message.model}` : ''}`}
             </em>
           )}
         </div>
@@ -4444,6 +4570,7 @@ function MessageItem({
 }
 
 function StaffView({
+  token,
   companyName,
   departments,
   agents,
@@ -4453,6 +4580,7 @@ function StaffView({
   onOpenTeamCompiler,
   onOpenAgent,
 }: {
+  token: string;
   companyName: string;
   departments: Department[];
   agents: Agent[];
@@ -4463,6 +4591,30 @@ function StaffView({
   onOpenAgent: (id: string) => void;
 }) {
   const { t } = useTranslation();
+  const [operations, setOperations] = useState<{
+    agents: Record<string, number>;
+    agent_states: Array<{
+      agent_id: string;
+      activity: string;
+      current_task_id: string | null;
+      updated_at: string | null;
+    }>;
+    runs: Record<string, number>;
+    plans: Record<string, number>;
+    open_requests: number;
+    active_resources: number;
+  } | null>(null);
+
+  useEffect(() => {
+    const load = () => {
+      apiRequest<typeof operations>('/workforce/overview', { token })
+        .then(setOperations)
+        .catch(() => setOperations(null));
+    };
+    load();
+    const timer = window.setInterval(load, 5000);
+    return () => window.clearInterval(timer);
+  }, [token]);
   // Breadcrumb path of department ids, root → current. Multi-level org chart
   // (technical dept → backend center → data group), not a flat list — a
   // department can nest under another via parent_id.
@@ -4488,11 +4640,31 @@ function StaffView({
   const directMembers = currentParentId
     ? agents.filter((agent) => agent.departmentId === currentParentId)
     : [];
+  const stateByAgent = new Map(
+    (operations?.agent_states ?? []).map((state) => [state.agent_id, state]),
+  );
+  const activityByAgent = new Map(
+    [...stateByAgent].map(([agentId, state]) => [agentId, state.activity]),
+  );
+  const activeCount = operations
+    ? (operations.agents.focused ?? 0) + (operations.agents.triaging ?? 0)
+    : busyCount;
+
+  const displayedStatus = (agent: Agent) => {
+    return workforceActivityStatus(
+      activityByAgent.get(agent.id),
+      agent.statusKind,
+      agent.statusLabel,
+    );
+  };
 
   const renderMemberRow = (agent: Agent) => {
-    const currentTask = tasks.find(
-      (task) => task.owner === agent.id && task.status !== '已完成',
-    );
+    const currentTaskId = stateByAgent.get(agent.id)?.current_task_id;
+    const currentTask = tasks.find((task) => task.id === currentTaskId)
+      ?? tasks.find(
+        (task) => task.owner === agent.id && task.status === '进行中',
+      );
+    const status = displayedStatus(agent);
     return (
       <button
         className="org-member-row"
@@ -4516,9 +4688,9 @@ function StaffView({
             {currentTask ? ` | ${currentTask.title}` : ''}
           </p>
         </div>
-        <span style={{ color: dotColor(agent.statusKind) }}>
-          <i style={{ background: dotColor(agent.statusKind) }} />
-          {agent.statusLabel}
+        <span style={{ color: dotColor(status.kind) }}>
+          <i style={{ background: dotColor(status.kind) }} />
+          {status.label}
         </span>
       </button>
     );
@@ -4536,7 +4708,7 @@ function StaffView({
                   company: companyName,
                   agentCount: agents.length,
                   deptCount: departments.length,
-                  busyCount,
+                  busyCount: activeCount,
                 })}
               </p>
             </div>
@@ -4557,6 +4729,16 @@ function StaffView({
               </button>
             </div>
           </header>
+
+          {operations && (
+            <div className="company-operations" aria-label="公司运行总览">
+              <div><strong>{operations.agents.focused ?? 0}</strong><span>专注执行</span></div>
+              <div><strong>{operations.agents.triaging ?? 0}</strong><span>评估请求</span></div>
+              <div><strong>{operations.runs.running ?? 0}</strong><span>运行中 Run</span></div>
+              <div><strong>{operations.open_requests}</strong><span>待处理请求</span></div>
+              <div><strong>{operations.active_resources}</strong><span>占用资源</span></div>
+            </div>
+          )}
 
           <div className="org-body">
             <nav className="org-breadcrumb" aria-label="组织路径">
@@ -4580,10 +4762,20 @@ function StaffView({
               {childDepts.map((dept) => {
                 const members = descendantMembers(dept.id);
                 const busyMembers = members.filter(
-                  (agent) => agent.statusKind === 'busy',
+                  (agent) => {
+                    const activity = activityByAgent.get(agent.id);
+                    return activity
+                      ? activity === 'focused' || activity === 'triaging'
+                      : agent.statusKind === 'busy';
+                  },
                 ).length;
                 const waitingMembers = members.filter(
-                  (agent) => agent.statusKind === 'wait',
+                  (agent) => {
+                    const activity = activityByAgent.get(agent.id);
+                    return activity
+                      ? ['waiting', 'blocked', 'degraded'].includes(activity)
+                      : agent.statusKind === 'wait';
+                  },
                 ).length;
 
                 return (
@@ -5317,8 +5509,16 @@ function AgentDetail({
   const [grantKey, setGrantKey] = useState('');
   const [granting, setGranting] = useState(false);
   const [grantMsg, setGrantMsg] = useState('');
+  const [workbench, setWorkbench] = useState<AgentWorkbench | null>(null);
+
+  const loadWorkbench = () => {
+    apiRequest<AgentWorkbench>(`/agents/${agent.id}/workbench`, { token })
+      .then(setWorkbench)
+      .catch(() => setWorkbench(null));
+  };
 
   const loadGrowth = () => {
+    loadWorkbench();
     apiRequest<{ skills: { name: string; content: string }[] }>(
       `/agents/${agent.id}/skills`,
       { token },
@@ -5360,6 +5560,12 @@ function AgentDetail({
 
   useEffect(() => {
     loadGrowth();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [agent.id, token]);
+
+  useEffect(() => {
+    const timer = window.setInterval(loadWorkbench, 5000);
+    return () => window.clearInterval(timer);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [agent.id, token]);
 
@@ -5485,6 +5691,11 @@ function AgentDetail({
     pending: t('agentDetail.capPending'),
     disabled: t('agentDetail.capDisabled'),
   };
+  const liveStatus = workforceActivityStatus(
+    workbench?.state.activity,
+    agent.statusKind,
+    agent.statusLabel,
+  );
 
   return (
     <>
@@ -5505,8 +5716,8 @@ function AgentDetail({
           <h2>
             {agent.name}
             <span>
-              <i style={{ background: dotColor(agent.statusKind) }} />
-              {agent.statusLabel}
+              <i style={{ background: dotColor(liveStatus.kind) }} />
+              {liveStatus.label}
             </span>
           </h2>
           <p>
@@ -5520,6 +5731,8 @@ function AgentDetail({
         </header>
 
         <div className="drawer-scroll">
+          <AgentWorkbenchPanel workbench={workbench} />
+
           <section className="drawer-section">
             <h3>{t('agentDetail.description')}</h3>
             <p className="prompt-box">{agent.description || t('agentDetail.noDescription')}</p>
@@ -7545,7 +7758,7 @@ function RunTraceModal({
                   <div className="run-trace-card-meta">
                     <strong>{run.agent_name}</strong>
                     <span>
-                      {run.provider} · {run.model || '—'} · {formatTime(run.created_at)}
+                      Hermes ACP · {run.model || '—'} · {formatTime(run.created_at)}
                     </span>
                   </div>
                   <span className={`run-trace-status run-trace-status-${run.status}`}>
@@ -7644,7 +7857,9 @@ function ChipList({
   );
 }
 
-createRoot(document.getElementById('root')!).render(
+const root = window.agentpulseReactRoot ?? createRoot(document.getElementById('root')!);
+window.agentpulseReactRoot = root;
+root.render(
   <StrictMode>
     <App />
   </StrictMode>,

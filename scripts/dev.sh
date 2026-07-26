@@ -9,6 +9,11 @@ ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 API_DIR="$ROOT_DIR/services/api"
 LOG_DIR="$ROOT_DIR/.dev-logs"
 
+# The one-command development stack is PostgreSQL + real Hermes by contract.
+# Explicit caller-provided values still win for isolated or fail-closed runs.
+export AGENTPULSE_DATABASE_URL="${AGENTPULSE_DATABASE_URL:-postgresql://agentpulse:agentpulse@127.0.0.1:55432/agentpulse}"
+export AGENTPULSE_HERMES_PROVISIONING="${AGENTPULSE_HERMES_PROVISIONING:-true}"
+
 # 颜色
 GREEN='\033[0;32m'
 YELLOW='\033[0;33m'

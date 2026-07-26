@@ -115,9 +115,21 @@ Hermes 能力感知**自动路由**：主模型能看图就原生看；主模型
 
 ### 3.11 本机执行边界（TD-14R）
 
-服务端 Hermes 只能看到服务端 workdir，不能读取老板电脑。需要本机文件或电脑能力时，API 创建绑定 `workspace/device/local_project` 的持久 Run，由 Electron 主进程 Worker 领取并在用户授权目录执行。设备 Token 和本机绝对路径只保存在主进程安全存储；API 仅保存设备、项目显示名、路径哈希和授权范围。
+服务端 Hermes 只能看到服务端 workdir，不能读取老板电脑。需要本机文件或电脑能力时，API 创建绑定 `workspace/device/local_project` 的持久 Run，由 Electron 主进程 Worker 领取并在用户授权目录执行。老板可以在设置页选择目录，也可以在桌面消息中明确给出真实绝对路径；后一种由 Electron 在本机验证并自动绑定当前 Worker。设备 Token 和本机绝对路径只保存在主进程安全存储；API 仅保存设备、项目显示名、路径哈希和授权范围。`startLocalWorker()` 进程内幂等并发单飞，避免同一桌面实例产生相互竞争的设备身份。见 [ADR 0018](decisions/0018-boss-explicit-local-path-authorization.md)。
+
+**执行入口只有 Hermes ACP。** DeepSeek 目前可作为 Hermes 的模型供应商，但 API 不得直接调用它生成员工或控制回复；旧直连聊天入口固定拒绝。缺少 Hermes、Worker、项目授权或 execution receipt 时，产品必须报告阻塞/失败，不得以模型文本冒充执行结果。
 
 本机第一切片只执行只读项目分析，并通过 `execution_receipts`、Run lease 和事件接口回传事实。写文件、终端、浏览器登录、computer_use 和业务外部动作仍需审批运行时。没有 Worker、项目授权、Hermes profile 或真实最终产出时，Run 必须阻塞/失败，聊天不能把模型文本当作完成凭证。
+
+### 3.12 百人员工调度（TD-15）
+
+逻辑员工、前台工作流与物理执行槽分开建模：一个 workspace 可有至少 100 名员工；每名员工可持有多个 Task，但同一时刻最多一个 `leased/running/pausing` 前台 Run。不同员工能否并行由服务端 Hermes 槽、模型额度、本机设备、隔离浏览器、终端、项目写入和 `computer_use` 资源租约决定，不再固定每 workspace 并发 2。
+
+定向 `ping/@` 先落为 `WorkRequest`，系统只回“已送达”；目标员工在安全点由 Hermes triage Run 决定快速回答、接受、延后、拒绝或索要信息。持续工作才创建 Task。任务按 Fibonacci Story Point 与可审计价值/紧急/解锁/风险/老化公式排序，请求人身份无权重。自动抢占受 1.5 倍、绝对分差、原子操作和小时次数共同限制。
+
+调度策略、入队、容量领取和计划汇总位于 `orchestration/workforce.py`；runtime 只物化并执行 Hermes Run、维持心跳并适配结果。PostgreSQL 先以 `SKIP LOCKED` 锁候选行，再用事务级 advisory lock 串行员工槽、服务端容量和独占资源竞争；SQLite 提供事务式测试实现。硬产出依赖同时校验完成态与匹配类型的持久交付物。抢占保存 `hermes_session_id/checkpoint_json`，恢复同一 session。独立分支失败把计划置为 `degraded`，不会停止其他分支。
+
+内部争议不交给老板直接排队，而由与请求双方独立的 Hermes coordination Run 按已确认目标和证据裁决；目标本身缺失时才通知老板。所有请求、决定、依赖、抢占、恢复和协调结论投影到 `company_events`，`GET /api/workforce/events` 以 SSE 推送，只有风险、阻塞、争议和目标偏移标记主动通知老板。详见 [ADR 0017](decisions/0017-resource-aware-workforce-scheduler.md) 与 [TD-15](tech-design/TD-15-workforce-scheduler.md)。
 
 ## 4. 群讨论协议（自研 · 照 AutoGen 骨架）
 

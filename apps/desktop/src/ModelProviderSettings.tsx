@@ -54,8 +54,8 @@ export function ModelProviderSettings({
           <div className="model-provider-heading">
             <span className="model-provider-logo">D</span>
             <div>
-              <h2>DeepSeek</h2>
-              <p>{status?.model ?? 'deepseek-v4-pro'}</p>
+              <h2>Hermes 运行模型</h2>
+              <p>DeepSeek · {status?.model ?? 'deepseek-v4-pro'}</p>
             </div>
             <span
               className={`model-provider-state ${status?.configured ? 'configured' : 'waiting'}`}

@@ -32,6 +32,7 @@
 | E | [TD-11](TD-11-autonomous-content-execution.md) | 自媒体 AI 公司自动执行闭环：完整分工 brief → 一次确认 → 持久依赖调度 → 内容包 | **是** | 大 |
 | F | [TD-12](TD-12-cloud-deployment-and-desktop-distribution.md) | 官网下载 → 桌面注册/BYOK → 云端 API/Hermes 的部署分发闭环 | **是** | 大 |
 | G | [TD-13](TD-13-company-world-model.md) | 公司事件账本 → 记忆检索 → 独立同事协作 → 反思 | **是** | 大 |
+| H | [TD-15](TD-15-workforce-scheduler.md) | WorkRequest → 百人员工资源调度 → 安全抢占/恢复 → 工作台 | **是** | 大 |
 
 ## Worker AI 执行协议（领任务前必读）
 

@@ -1,11 +1,6 @@
 """Tests for provisioning orchestration (TD-04-T3).
 
-Covers:
-- draft_role_spec: capability key validation, stripping unknown keys
-- draft_role_spec: LLM keys union with user keys
-- draft_role_spec: risk_gate always from catalog, never from LLM
-- draft_soul_md: LLM output passthrough + fallback template
-- Prompt builders
+Covers role-spec capability validation and prompt construction.
 """
 
 import pytest
@@ -14,9 +9,7 @@ from app.orchestration.capability_catalog import CATALOG
 from app.orchestration.provisioning import (
     RoleSpecDraft,
     build_role_spec_prompt,
-    build_soul_md_prompt,
     draft_role_spec,
-    draft_soul_md,
 )
 
 
@@ -144,70 +137,6 @@ class TestBuildRoleSpecPrompt:
     def test_prompt_contains_descriptions(self):
         prompt = build_role_spec_prompt("测试")
         assert "编写、修改代码文件" in prompt  # write_code description
-
-
-class TestBuildSoulMdPrompt:
-    def test_prompt_contains_role_and_company(self):
-        prompt = build_soul_md_prompt(
-            role_name="前端工程师",
-            responsibilities=["写代码", "发PR"],
-            capability_keys=["write_code"],
-            company_name="测试公司",
-        )
-        assert "测试公司" in prompt
-
-    def test_prompt_with_empty_responsibilities(self):
-        prompt = build_soul_md_prompt(
-            role_name="员工",
-            responsibilities=[],
-            capability_keys=[],
-        )
-        assert "待补充" in prompt
-
-
-class TestDraftSoulMd:
-    def test_llm_output_used_directly(self):
-        """When llm_soul_text provided, it's returned as-is."""
-        soul = "# 前端工程师\n\n你是专业的前端工程师。"
-        result = draft_soul_md(
-            role_name="前端工程师",
-            responsibilities=["写代码"],
-            capability_keys=["write_code"],
-            llm_soul_text=soul,
-        )
-        assert result == soul
-
-    def test_fallback_template_generated(self):
-        """Without LLM, a template is generated."""
-        result = draft_soul_md(
-            role_name="前端工程师",
-            responsibilities=["写React组件", "发PR"],
-            capability_keys=["write_code", "git_push"],
-            company_name="AgentPulse",
-        )
-        assert "# 前端工程师" in result
-        assert "写React组件" in result
-        assert "背景不清楚时先提问" in result
-        assert "AgentPulse" in result
-
-    def test_fallback_no_capabilities(self):
-        """Fallback with no capabilities still works."""
-        result = draft_soul_md(
-            role_name="通用助手",
-            responsibilities=["协助工作"],
-            capability_keys=[],
-        )
-        assert "# 通用助手" in result
-        assert "暂无" in result
-
-    def test_fallback_no_responsibilities(self):
-        """Fallback with no responsibilities still works."""
-        result = draft_soul_md(
-            role_name="员工",
-            responsibilities=[],
-            capability_keys=["write_code"],
-        )
-        assert "待确认" in result
 
 
 class TestRealWorldScenarios:

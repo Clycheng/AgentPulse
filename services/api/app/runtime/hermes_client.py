@@ -22,6 +22,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from app.runtime.runtime_guard import safe_project_path
+
 # Reasoning is forwarded through step updates; map ACP update class names to our
 # coarse AgentEvent types.
 _UPDATE_TYPE_MAP = {
@@ -61,6 +63,7 @@ class RunContext:
     conversation_id: str = ""
     task_id: str = ""
     context_manifest_id: str | None = None
+    resume_session_id: str | None = None
     mcp_servers: list[dict] = field(default_factory=list)
     environment: dict[str, str] = field(default_factory=dict)
     timeout: int = 600
@@ -109,14 +112,10 @@ def _build_mcp_servers(acp_module: Any, servers: list[dict]) -> list[Any]:
 
 def _safe_path(workdir: str, path: str) -> Path:
     """Resolve ``path`` and refuse anything outside ``workdir`` (ADR 0005)."""
-    root = Path(workdir).resolve()
-    candidate = Path(path)
-    if not candidate.is_absolute():
-        candidate = root / candidate
-    resolved = candidate.resolve()
-    if root != resolved and root not in resolved.parents:
-        raise HermesBackendError(f"path escapes workdir: {path!r}")
-    return resolved
+    try:
+        return safe_project_path(workdir, path)
+    except ValueError as exc:
+        raise HermesBackendError(f"unsafe workdir path: {path!r}") from exc
 
 
 def _make_client(
@@ -288,12 +287,42 @@ class HermesBackend:
         )
 
         async def drive() -> AgentEvent:
-            await conn.initialize(protocol_version=acp.PROTOCOL_VERSION)
+            await conn.initialize(
+                protocol_version=acp.PROTOCOL_VERSION,
+                client_capabilities=acp.schema.ClientCapabilities(
+                    fs=acp.schema.FileSystemCapabilities(
+                        read_text_file=True,
+                        write_text_file=True,
+                    ),
+                    terminal=False,
+                ),
+            )
             mcp_servers = _build_mcp_servers(acp, ctx.mcp_servers)
-            session = await conn.new_session(cwd=ctx.workdir, mcp_servers=mcp_servers)
+            if ctx.resume_session_id:
+                try:
+                    await conn.load_session(
+                        cwd=ctx.workdir,
+                        session_id=ctx.resume_session_id,
+                        mcp_servers=mcp_servers,
+                    )
+                except Exception:
+                    await conn.resume_session(
+                        cwd=ctx.workdir,
+                        session_id=ctx.resume_session_id,
+                        mcp_servers=mcp_servers,
+                    )
+                session_id = ctx.resume_session_id
+                resumed = True
+            else:
+                session = await conn.new_session(cwd=ctx.workdir, mcp_servers=mcp_servers)
+                session_id = session.session_id
+                resumed = False
+            await queue.put(
+                AgentEvent("session", {"session_id": session_id, "resumed": resumed})
+            )
             result = await conn.prompt(
                 prompt=[acp.schema.TextContentBlock(type="text", text=ctx.prompt)],
-                session_id=session.session_id,
+                session_id=session_id,
             )
             stop = getattr(result, "stop_reason", None)
             return AgentEvent("final", {"stop_reason": str(stop)})
@@ -326,6 +355,20 @@ class HermesBackend:
                 yield AgentEvent("error", {"detail": "hermes run timed out"})
                 return
         finally:
+            if not drive_task.done():
+                session_id = ctx.resume_session_id
+                if not session_id:
+                    # The session event may still be buffered when cancellation
+                    # arrives, so inspect the queued event without consuming it.
+                    for queued in list(getattr(queue, "_queue", [])):
+                        if queued.type == "session":
+                            session_id = queued.payload.get("session_id")
+                            break
+                if session_id:
+                    try:
+                        await conn.cancel(session_id=session_id)
+                    except Exception:
+                        pass
             drive_task.cancel()
             try:
                 await conn.close()

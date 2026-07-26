@@ -376,9 +376,9 @@ async def _handle_create_employee(
 ) -> str:
     """Create one employee — and, if capability_keys are given, a real one.
 
-    Without capability_keys this is unchanged from before: a name-tag
-    employee that only ever talks through the temporary DeepSeek fallback.
-    With them, it runs through the same provision_new_agent() every other
+    Without capability_keys this still creates an employee record, but the
+    employee remains blocked until a Hermes profile is provisioned. With
+    capabilities it runs through the same provision_new_agent() every other
     hiring path uses (Talent Market, the team compiler), so an employee the
     boss describes to the secretary in chat can come out just as real as
     one hand-configured through a form.
@@ -1053,12 +1053,10 @@ def system_prompt_for_operator(
 ) -> str:
     """System prompt that tells the agent it can operate the system.
 
-    Also carries the same company-knowledge / related-task / personal-experience
-    context that the non-tool DeepSeek path injects, so switching to the Agent
-    Action Bridge doesn't silently drop that context (see deepseek.py's
-    build_system_prompt for the sibling formatters).
+    Also carries company knowledge, related tasks, and employee experience for
+    the legacy company-tool handler. Employee execution itself uses Hermes ACP.
     """
-    from app.runtime.deepseek import (
+    from app.runtime.hermes_prompts import (
         format_agent_experiences,
         format_knowledge_sources,
         format_related_tasks,

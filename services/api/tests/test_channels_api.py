@@ -8,9 +8,9 @@ from fastapi.testclient import TestClient
 
 from app.api.routes import workspace as workspace_routes
 from app.core.config import settings
-from app.core.database import init_db
+from app.core.database import connect, init_db
 from app.main import app
-from app.schemas.run import LlmChatResponse
+from app.services.workspace import add_message
 
 
 def make_client(tmp_path, monkeypatch) -> TestClient:
@@ -140,6 +140,41 @@ def test_webhook_inbound_persists_message(tmp_path, monkeypatch):
     assert detail["stats"]["active_external_users"] == 1
 
 
+def test_webhook_redacts_local_path_and_blocks_server_execution(tmp_path, monkeypatch):
+    client = make_client(tmp_path, monkeypatch)
+    token, agent_id = register(client)
+    chan = _create_generic_channel(client, token, agent_id=agent_id)
+
+    response = client.post(
+        chan["webhook_url"],
+        json={
+            "user_id": "cust_local",
+            "message": "读取 /Users/example/code/private-project 并汇报",
+            "message_id": "local-path-1",
+        },
+    )
+    assert response.status_code == 200
+    assert response.json()["replied"] is True
+
+    conn = connect()
+    try:
+        messages = conn.execute(
+            "SELECT content, sender_type FROM messages ORDER BY created_at"
+        ).fetchall()
+        assert all("/Users/example" not in row["content"] for row in messages)
+        assert any(
+            row["sender_type"] == "user" and "[已授权本机项目路径]" in row["content"]
+            for row in messages
+        )
+        assert any(
+            row["sender_type"] == "agent" and "尚未执行" in row["content"]
+            for row in messages
+        )
+        assert conn.execute("SELECT COUNT(*) AS count FROM runs").fetchone()["count"] == 0
+    finally:
+        conn.close()
+
+
 def test_webhook_unknown_token_404(tmp_path, monkeypatch):
     client = make_client(tmp_path, monkeypatch)
     register(client)
@@ -197,15 +232,22 @@ def test_webhook_unsupported_channel_type(tmp_path, monkeypatch):
 
 
 def test_webhook_triggers_agent_reply(tmp_path, monkeypatch):
-    async def fake_complete(self, payload):
-        return LlmChatResponse(
-            reply="您好，我们 9:00-18:00 营业。",
-            provider="deepseek",
-            model="deepseek-v4-flash",
-            usage={"total_tokens": 20},
+    async def fake_hermes_reply(
+        conn, *, conversation_id, agent, **_kwargs
+    ):
+        message = add_message(
+            conn,
+            conversation_id=conversation_id,
+            sender_type="agent",
+            sender_id=agent["id"],
+            content="您好，我们 9:00-18:00 营业。",
+            provider="hermes",
+            model="",
         )
+        conn.commit()
+        return message
 
-    monkeypatch.setattr(workspace_routes.DeepSeekChatClient, "complete", fake_complete)
+    monkeypatch.setattr(workspace_routes, "complete_agent_reply", fake_hermes_reply)
 
     client = make_client(tmp_path, monkeypatch)
     token, agent_id = register(client)

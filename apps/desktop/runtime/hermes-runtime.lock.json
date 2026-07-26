@@ -1,0 +1,10 @@
+{
+  "hermes": {
+    "repository": "https://github.com/NousResearch/hermes-agent.git",
+    "version": "0.18.2",
+    "commit": "e4ea0a0ed7fc24761b2b425146893561a73216e1"
+  },
+  "python": {
+    "version": "3.11"
+  }
+}

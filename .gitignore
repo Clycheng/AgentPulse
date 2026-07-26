@@ -10,6 +10,8 @@ dist-electron/
 build/
 release/
 *.tsbuildinfo
+apps/desktop/runtime-stage/
+apps/desktop/.runtime-cache/
 
 # env
 .env

@@ -3,7 +3,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, Field
 
 
-class LlmChatAgent(BaseModel):
+class HermesRunAgent(BaseModel):
     id: str = Field(min_length=1, max_length=80)
     name: str = Field(min_length=1, max_length=80)
     role: str = Field(default="", max_length=120)
@@ -12,13 +12,13 @@ class LlmChatAgent(BaseModel):
     skills: list[str] = Field(default_factory=list, max_length=20)
 
 
-class LlmChatMessage(BaseModel):
+class HermesRunMessage(BaseModel):
     role: Literal["user", "assistant"]
     content: str = Field(min_length=1, max_length=12000)
     name: str | None = Field(default=None, max_length=80)
 
 
-class LlmTaskContext(BaseModel):
+class HermesTaskContext(BaseModel):
     id: str = Field(min_length=1, max_length=80)
     title: str = Field(min_length=1, max_length=160)
     status: str = Field(default="", max_length=40)
@@ -28,7 +28,7 @@ class LlmTaskContext(BaseModel):
     description: str = Field(default="", max_length=2000)
 
 
-class LlmAgentExperience(BaseModel):
+class HermesAgentExperience(BaseModel):
     id: str = Field(min_length=1, max_length=80)
     task_id: str | None = Field(default=None, max_length=80)
     outcome: str = Field(default="", max_length=40)
@@ -36,23 +36,23 @@ class LlmAgentExperience(BaseModel):
     lessons: str = Field(default="", max_length=1000)
 
 
-class LlmKnowledgeSource(BaseModel):
+class HermesKnowledgeSource(BaseModel):
     id: str = Field(min_length=1, max_length=80)
     title: str = Field(min_length=1, max_length=160)
     category: str = Field(default="", max_length=80)
     content: str = Field(min_length=1, max_length=2000)
 
 
-class LlmChatRequest(BaseModel):
+class HermesRunContext(BaseModel):
     company_name: str = Field(default="一人公司", max_length=120)
     conversation_title: str = Field(default="", max_length=160)
-    agent: LlmChatAgent
-    messages: list[LlmChatMessage] = Field(min_length=1, max_length=24)
-    related_tasks: list[LlmTaskContext] = Field(default_factory=list, max_length=12)
-    knowledge_sources: list[LlmKnowledgeSource] = Field(
+    agent: HermesRunAgent
+    messages: list[HermesRunMessage] = Field(min_length=1, max_length=24)
+    related_tasks: list[HermesTaskContext] = Field(default_factory=list, max_length=12)
+    knowledge_sources: list[HermesKnowledgeSource] = Field(
         default_factory=list, max_length=5
     )
-    agent_experiences: list[LlmAgentExperience] = Field(
+    agent_experiences: list[HermesAgentExperience] = Field(
         default_factory=list, max_length=8
     )
     discussion_context: str = Field(
@@ -66,13 +66,6 @@ class LlmChatRequest(BaseModel):
         description="Evidence-backed company memory selected for this turn",
     )
     context_manifest_id: str | None = Field(default=None, max_length=80)
-
-
-class LlmChatResponse(BaseModel):
-    reply: str
-    provider: str = "deepseek"
-    model: str
-    usage: dict[str, Any] | None = None
 
 
 class RunStepOut(BaseModel):

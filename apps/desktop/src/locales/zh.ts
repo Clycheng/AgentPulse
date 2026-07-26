@@ -18,7 +18,7 @@ const translations = {
   },
   "auth": {
     "heroTitle": "把一人公司，搭成一支 AI 团队。",
-    "heroSubtitle": "注册后自动创建四人内容团队。连接你的 DeepSeek Key，就可以开始讨论、分工和自动执行。",
+    "heroSubtitle": "注册后自动创建四人内容团队。配置供 Hermes 使用的 DeepSeek Key，即可开始讨论、分工和自动执行。",
     "feature1Title": "组织化智能体",
     "feature1Desc": "部门、员工、职责 Prompt 都能沉淀",
     "feature2Title": "从消息开始协作",
@@ -98,25 +98,25 @@ const translations = {
     "loading": "加载中…"
   },
   "modelSettings": {
-    "title": "模型设置",
-    "summary": "管理当前工作区用于 AI 员工运行的模型凭证",
+    "title": "Hermes 模型凭证",
+    "summary": "管理当前工作区仅供 Hermes Run 使用的模型凭证",
     "configured": "已连接",
     "unconfigured": "等待配置",
-    "apiKey": "DeepSeek API Key",
+    "apiKey": "DeepSeek API Key（仅供 Hermes）",
     "notSet": "未配置",
     "teamSupply": "团队状态",
     "teamSupplyValue": "{{ready}} / {{total}} 名员工已就位",
     "validation": "凭证状态",
     "valid": "验证通过",
     "pending": "等待验证",
-    "configureKey": "连接 DeepSeek",
+    "configureKey": "配置 Hermes 模型",
     "replaceKey": "更换 Key",
     "revokeKey": "撤销 Key",
     "revokeConfirm": "撤销后所有新 Run 都会停止，历史数据会保留。确认撤销吗？",
-    "modalTitle": "连接 DeepSeek",
-    "modalSubtitle": "Key 验证成功后，当前工作区的四名员工会自动就位。",
+    "modalTitle": "配置 Hermes 模型",
+    "modalSubtitle": "Key 仅会按需注入短期 Hermes Run，当前工作区的四名员工会自动就位。",
     "validating": "正在验证…",
-    "saveKey": "验证并连接"
+    "saveKey": "验证并配置"
   },
   "ideas": {
     "title": "想法中心",

@@ -65,6 +65,33 @@ def test_create_agent_without_role_spec(tmp_path, monkeypatch):
     assert "spec" not in data or data.get("spec") is None
 
 
+def test_create_agent_uses_shared_provisioning_entry(tmp_path, monkeypatch):
+    client = make_client(tmp_path, monkeypatch)
+    auth = register_user(client)
+    calls: list[dict] = []
+
+    def provision_stub(_conn, **kwargs):
+        calls.append(kwargs)
+        return None
+
+    monkeypatch.setattr(
+        "app.api.routes.workspace.provision_new_agent", provision_stub
+    )
+    response = client.post(
+        "/api/agents",
+        headers=auth_header(auth["access_token"]),
+        json={
+            "name": "统一入口员工",
+            "description": "测试",
+            "department_name": "技术部",
+            "prompt": "你是测试员工",
+        },
+    )
+    assert response.status_code == 200
+    assert calls and calls[0]["role_name"] == "测试"
+    assert calls[0]["capability_keys"] == []
+
+
 def test_create_agent_with_role_spec_auto_capabilities(tmp_path, monkeypatch):
     """POST /api/agents with role_spec + auto capabilities → spec status = ready."""
     client = make_client(tmp_path, monkeypatch)

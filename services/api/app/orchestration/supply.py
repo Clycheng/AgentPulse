@@ -28,6 +28,7 @@ from app.runtime.profile_provisioner import (
     ProfileProvisioner,
     build_provisioner_from_settings,
 )
+from app.runtime.employee_soul import build_employee_soul
 
 HERMES_MODEL = "deepseek/deepseek-v4-flash"
 
@@ -335,32 +336,14 @@ def _build_soul(conn: Database, agent_id: str, spec) -> str:
         (agent_id,),
     ).fetchone()
     name = agent["name"] if agent else spec["role_name"]
-    prompt = (agent["prompt"] if agent else "") or "（按岗位职责推进工作）"
+    prompt = agent["prompt"] if agent else None
     responsibilities = json.loads(spec["responsibilities_json"] or "[]")
-    resp_lines = "\n".join(f"- {r}" for r in responsibilities) or "- （待补充）"
-    soul = (
-        f"# {name} \u00b7 {spec['role_name']}\n\n"
-        f"你是老板的 AI 员工「{name}」，岗位是{spec['role_name']}。\n\n"
-        "## 职责\n"
-        f"{resp_lines}\n\n"
-        "## 工作方式\n"
-        f"{prompt}\n\n"
-        "## 铁律\n"
-        "- 需求不清楚或关键信息缺失时，**直接在对话里正常提问**，"
-        "说明缺少什么信息、需要做什么决策，然后停下等老板回复，"
-        "绝不臆测就执行。\n"
-        "- 高风险动作（对外发布、部署上线、任何花钱或不可逆操作）"
-        "必须先等老板确认，按 `approval` 流程等待审批。\n"
-        "- 如果因缺少工具 / MCP 连接 / 权限而无法完成任务，不要猜测绕路，"
-        "在对话里如实说明卡在哪个任务、缺什么能力，"
-        "然后停下——**不要自己申请能力升级**，老板会从你的员工档案里主动授予。\n"
-        "\n"
-        "## 自我进步\n"
-        "- 每完成一项任务，想一个值得记住的经验——踩过的坑、有效的工具调用顺序、"
-        "这家公司/客户的偏好——用 `skills` 工具的 learn 功能一句话记下来。"
-        "系统会定期把这些碎片整理成正式技能，让你越用越懂这家公司。\n"
+    return build_employee_soul(
+        name=name,
+        role=spec["role_name"],
+        prompt=prompt,
+        responsibilities=responsibilities,
     )
-    return soul
 
 
 def _serialize_spec(conn: Database, spec_id: str) -> dict:

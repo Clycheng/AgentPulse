@@ -4,8 +4,8 @@ import pytest
 
 from app.core.config import settings
 from app.core.database import connect, init_db
-from app.runtime.deepseek import build_system_prompt
-from app.schemas.run import LlmChatAgent, LlmChatMessage, LlmChatRequest
+from app.runtime.hermes_prompts import build_hermes_context_prompt
+from app.schemas.run import HermesRunAgent, HermesRunContext, HermesRunMessage
 from app.services.company_memory import (
     build_context_manifest,
     record_company_event,
@@ -195,17 +195,17 @@ def test_transcript_overflow_creates_evidence_backed_episode_without_deleting_ev
 
 
 def test_employee_prompt_uses_colleague_semantics_without_runtime_identity_terms():
-    request = LlmChatRequest(
+    request = HermesRunContext(
         company_name="记忆公司",
-        agent=LlmChatAgent(
+        agent=HermesRunAgent(
             id="internal-id",
             name="内容策划",
             role="内容策划",
             prompt="基于证据制定内容计划。",
         ),
-        messages=[LlmChatMessage(role="user", content="整理本周选题")],
+        messages=[HermesRunMessage(role="user", content="整理本周选题")],
     )
-    prompt = build_system_prompt(request)
+    prompt = build_hermes_context_prompt(request)
     assert "公司中的一名同事" in prompt
     assert all(term not in prompt for term in ("AI 员工", "agent_id", "sender_type", "Hermes"))
 

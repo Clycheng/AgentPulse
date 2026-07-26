@@ -49,9 +49,7 @@ from app.orchestration.gate import (
 from app.orchestration.provisioning import (
     RoleSpecDraft,
     build_role_spec_prompt,
-    build_soul_md_prompt,
     draft_role_spec,
-    draft_soul_md,
 )
 from app.orchestration.supply import (
     ProvisioningError,
@@ -89,9 +87,7 @@ __all__ = [
     "validate_capability_keys",
     "RoleSpecDraft",
     "build_role_spec_prompt",
-    "build_soul_md_prompt",
     "draft_role_spec",
-    "draft_soul_md",
     "ProvisioningError",
     "create_agent_spec",
     "provision",
